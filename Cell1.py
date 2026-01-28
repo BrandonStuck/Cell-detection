@@ -54,94 +54,86 @@ def stripe_mask_from_rotated(gray_rot):
     return mask
 
 
+#---------preprocess image--------------------
+def preprocess_for_cells(img, stripe_mask):
+    """
+    Extracts the green channel, boosts rim contrast using CLAHE,
+    then applies Difference-of-Gaussians before masking.
+    """
+
+    # 1. Use green channel (cell rims are most visible here)
+    gray = img[:, :, 1]
+
+    # 2. Local contrast boost (pre-mask to avoid local context loss)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+
+    # 3. Apply stripe mask
+    masked = cv2.bitwise_and(gray, gray, mask=stripe_mask)
+
+    # 4. Difference of Gaussians (enhances soft circular rims)
+    blur_small = cv2.GaussianBlur(masked, (3,3), 0.5)
+    blur_large = cv2.GaussianBlur(masked, (9,9), 3)
+    dog = cv2.subtract(blur_small, blur_large)
+
+    return dog
+
 # ----------Circle Detection------------------
-def detect_hough_circles(masked_gray, min_r, max_r, param2=22):
-    gb = cv2.GaussianBlur(masked_gray, (7,7), 1.5)
-    if np.count_nonzero(gb) < 10:
+def detect_hough_circles(cell_preprocessed, min_r, max_r):
+    # If the region has no content, skip
+    if np.count_nonzero(cell_preprocessed) < 50:
         return []
+
     circles = cv2.HoughCircles(
-        gb, cv2.HOUGH_GRADIENT, dp=1.2,
-        minDist=max(8, int(min_r * 0.6)),
-        param1=50, param2=param2,
-        minRadius=max(1, int(min_r * 0.8)), maxRadius=int(max_r * 1.2)
+        cell_preprocessed,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(10, int(min_r * 1.2)),
+        param1=80,      # low Canny threshold
+        param2=20,       # VERY important: sensitive threshold for weak rims
+        minRadius=min_r,
+        maxRadius=max_r
     )
-    res = []
-    if circles is not None:
-        circles = np.uint16(np.around(circles))
-        for c in circles[0]:
-            res.append((int(c[0]), int(c[1]), int(c[2])))
-    return res
+
+    if circles is None:
+        return []
+
+    circles = np.int32(np.round(circles[0]))
+    return [(x, y, r) for (x, y, r) in circles]
 
 def detect_outer_contours(gray, min_r, max_r):
-    """Detect circular outer contours around inner circles."""
-    edges = cv2.Canny(gray, 30, 100)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    edges = cv2.dilate(edges, kernel, iterations=2)
+    edges = cv2.Canny(gray, 25, 60)
+    edges = cv2.dilate(edges, None, iterations=1)
+
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     res = []
     for cnt in contours:
         (x, y), r = cv2.minEnclosingCircle(cnt)
         r = int(r)
-        if r < min_r or r > max_r * 3:  # expanded range to catch full outer walls
-            continue
-        area = cv2.contourArea(cnt)
-        circ = 4 * math.pi * area / (cv2.arcLength(cnt, True) ** 2 + 1e-6)
-        if circ > 0.6:  # roughly circular
-            res.append((int(x), int(y), r))
 
+        if r < min_r or r > max_r * 3:
+            continue
+
+        area = cv2.contourArea(cnt)
+        if area < 8:
+            continue
+
+        # circularity check
+        peri = cv2.arcLength(cnt, True)
+        if peri == 0:
+            continue
+
+        circ = 4 * math.pi * area / (peri * peri)
+        if circ > 0.55:
+            res.append((int(x), int(y), r))
 
     return res
 
+
 #------------Merge Duplicated Circles--------------------
-def deduplicate_circles(circles, min_r=6, max_r=30, center_thresh=0.5, radius_thresh=0.4):
-    """
-    Merge duplicates and remove false detections.
-    Two circles are considered the same if:
-    - Their centers are closer than (center_thresh * average radius)
-    - Their radii differ by less than (radius_thresh * average radius)
-    """
-    if not circles:
-        return []
 
-    # remove extreme radius outliers first
-    circles = [(x, y, r) for (x, y, r) in circles if min_r <= r <= max_r]
-
-    unique = []
-    for (x, y, r) in circles:
-        merged = False
-        for i, (ux, uy, ur) in enumerate(unique):
-            dist = np.hypot(x - ux, y - uy)
-            if dist < center_thresh * (r + ur) / 2 and abs(r - ur) < radius_thresh * (r + ur) / 2:
-                # merge (average weighted by radius)
-                unique[i] = ((ux + x) / 2, (uy + y) / 2, (ur + r) / 2)
-                merged = True
-                break
-        if not merged:
-            unique.append((x, y, r))
-
-    print(f"[DEDUP] input={len(circles)}, unique={len(unique)}")
-    return unique
-
-#-------------Eliminate False Detected Circles------------
-def remove_nearby_false_circles(circles, real_circles, min_distance_factor=1.2):
-    """
-    Remove candidate circles that are too close to confirmed real droplets.
-    Keeps isolated circles.
-    """
-    filtered = []
-    for c in circles:
-        too_close = False
-        for rc in real_circles:
-            d = math.hypot(c[0] - rc[0], c[1] - rc[1])
-            if d < min_distance_factor * (c[2] + rc[2]):
-                too_close = True
-                break
-        if not too_close:
-            filtered.append(c)
-    return filtered
-
-def is_real_cell(gray, x, y, r):
+def dedupe_color(gray, x, y, r):
     """
     Returns True if the circle at (x, y) with radius r appears to be a real droplet:
     - Bright center
@@ -175,7 +167,7 @@ def is_real_cell(gray, x, y, r):
     return (center_brightness - ring_darkness) > 18  # adjust threshold as needed
 
 
-def filter_by_min_distance(circles, min_distance):
+def dedupe_min_distance(circles, min_distance):
     """
     Removes circles that are too close to any other circle.
     Only keeps circles that are at least `min_distance` apart.
@@ -196,6 +188,26 @@ def filter_by_min_distance(circles, min_distance):
         if not too_close:
             filtered.append(c)
     return filtered
+
+def merge(circles, gray, min_distance):
+    """
+    Combines color-based validation and distance-based deduplication.
+
+    circles: list of (x, y, r)
+    gray: grayscale image
+    min_distance: minimum distance between circle centers
+    """
+
+    # Step 1: color / contrast filtering
+    color_filtered = []
+    for (x, y, r) in circles:
+        if dedupe_color(gray, x, y, r):
+            color_filtered.append((x, y, r))
+
+    # Step 2: spatial deduplication
+    final_circles = dedupe_min_distance(color_filtered, min_distance)
+
+    return final_circles
 
 
 # -------------Cluster Detection------------------------
@@ -264,7 +276,7 @@ def draw_clusters_and_circles(base_img, unique_circles, clusters):
 
 
 #--------------Main---------------
-def main(min_r=6, max_r=30):
+def main(min_r, max_r):
     # select file
     Tk().withdraw()
     filename = filedialog.askopenfilename(title="Select an image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp")])
@@ -288,25 +300,28 @@ def main(min_r=6, max_r=30):
     masked_gray = cv2.bitwise_and(gray_rot, gray_rot, mask=mask_stripes)
 
     # --- detect circles ---
-    hough_circles = detect_hough_circles(masked_gray, min_r, max_r, param2=30)
-    contour_circles = detect_outer_contours(gray_rot, min_r, max_r)
+    pp = preprocess_for_cells(img_color, mask_stripes)
+    hough_circles = detect_hough_circles(pp, min_r, max_r)
+    contour_circles = detect_outer_contours(pp, min_r, max_r)
     combined = hough_circles + contour_circles
 
-    # --- Filter real droplets ---
-    combined = filter_by_min_distance(combined, min_distance=15)
-    real_circles = [c for c in combined if is_real_droplet(gray_rot, *c)]
-    print(f"Real droplets detected: {len(real_circles)}")
+    # --- Filter real droplets --
+    real_circles = [c for c in combined if dedupe_color(gray_rot, *c)]
 
-    # --- Remove nearby false detections ---
-    filtered_circles = remove_nearby_false_circles(combined, real_circles, min_distance_factor=1.2)
+        # --- Step 1: color-based filtering ---
+    real_circles = [c for c in combined if dedupe_color(gray_rot, *c)]
+    print(f"Cells after color filter: {len(real_circles)}")
 
-    print(f"Filtered circles after removing too-close false detections: {len(filtered_circles)}")
+        # --- Step 2: distance-based dedupe ---
+    if real_circles:
+        avg_r = np.mean([r for (_, _, r) in real_circles])
+        min_distance = 2.0 * avg_r
+    else:
+        min_distance = 0
 
-    # --- Merge real + filtered circles
-    unique_circles = deduplicate_circles(real_circles + filtered_circles, min_r=min_r, max_r=max_r,
-                                         center_thresh=6, radius_thresh=4)
+    unique_circles = dedupe_min_distance(real_circles, min_distance)
 
-
+    print(f"Unique cells: {len(unique_circles)}")
 
     # Print detection counts
     print(f"Hough detections: {len(hough_circles)}")
@@ -346,4 +361,4 @@ def main(min_r=6, max_r=30):
 
 
 # run main with provided min/max radii
-main(min_r=6, max_r=30)
+main(min_r=12, max_r=30)
