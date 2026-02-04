@@ -267,102 +267,128 @@ def draw_cells_and_clusters(
 
 
 #--------------Main---------------
-def main(min_sigma=2.0, max_sigma=8.0):
-    #  File selection ----------------
-    Tk().withdraw()
-    filename = filedialog.askopenfilename(
-        title="Select image",
-        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp")]
-    )
-    if not filename:
-        print("No file selected.")
-        return
+def main(
+    min_sigma=2.0,
+    max_sigma=8.0,
+    num_scales=10,
+    focus_sigma_thresh=4.5,
+    min_dist=6,
+    cluster_eps=18,
+    min_cluster_size=2,
+    debug=True
+):
+    # --------------------------------------------------
+    # Load image
+    # --------------------------------------------------
 
-    img_color = cv2.imread(filename)
+    image_path = input("Enter image path: ").strip()
+
+    img_color = cv2.imread(image_path)
     if img_color is None:
-        print("Failed to load image.")
-        return
+        raise FileNotFoundError(f"Could not load image: {image_path}")
 
-    # Rotation ----------------
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
-    angle = estimate_rotation_angle(gray)
-    gray_rot = rotate_image(gray, -angle)
-    img_rot_color = rotate_image(img_color, -angle)
 
-    #  Stripe mask ----------------
-    mask_stripes = stripe_mask_from_rotated(gray_rot)
+    # --------------------------------------------------
+    # Estimate rotation + rotate
+    # --------------------------------------------------
+    angle = estimate_rotation_angle(gray, debug=debug)
+    img_rot = rotate_image(img_color, angle)
+    gray_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
 
-    # Preprocessing ----------------
-    response = preprocess_for_cells(img_rot_color, mask_stripes)
+    # --------------------------------------------------
+    # Stripe mask (on rotated image)
+    # --------------------------------------------------
+    stripe_mask = stripe_mask_from_rotated(gray_rot)
 
-    # LoG peak detection ----------------
-    cells = detect_cells_log(
-        response,
-        min_sigma=min_sigma,
-        max_sigma=max_sigma,
-        threshold=0.02,
-        min_distance=6
+    # --------------------------------------------------
+    # Preprocessing → response-ready image
+    # --------------------------------------------------
+    pp = preprocess_for_cells(img_rot, stripe_mask)
+
+    # --------------------------------------------------
+    # Multi-scale LoG detection (PURE detection)
+    # --------------------------------------------------
+    sigmas = np.linspace(min_sigma, max_sigma, num_scales)
+    cells = detect_cells_log(pp, sigmas)
+
+    if debug:
+        print(f"Raw detections: {len(cells)}")
+
+    # --------------------------------------------------
+    # Focus classification (in / out)
+    # --------------------------------------------------
+    cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
+
+    # --------------------------------------------------
+    # Non-maximum suppression (merge duplicates)
+    # --------------------------------------------------
+    cells = filter_min_distance(cells, min_dist=min_dist)
+
+    if debug:
+        print(f"After min-distance filtering: {len(cells)}")
+
+    # --------------------------------------------------
+    # Separate in-focus vs out-of-focus
+    # --------------------------------------------------
+    in_focus_cells = [c for c in cells if c["focus"] == "in"]
+    out_of_focus_cells = [c for c in cells if c["focus"] == "out"]
+
+    # --------------------------------------------------
+    # Cluster detection (DBSCAN on in-focus only)
+    # --------------------------------------------------
+    labels, n_clusters = find_clusters_dbscan(
+        in_focus_cells,
+        eps=cluster_eps,
+        min_samples=min_cluster_size
     )
 
-    print(f"Candidate cells detected: {len(cells)}")
-
-    # Focus classification ----------------
-    cells = classify_focus(
-        response,
-        cells,
-        inner_scale=0.6,
-        outer_scale=1.6
-    )
-
-    # Split by focus ----------------
-    in_focus_cells = [c for c in cells if c["focus"] >= 0.25]
-    out_of_focus_cells = [c for c in cells if c["focus"] < 0.25]
-
-    print(f"In-focus cells: {len(in_focus_cells)}")
-    print(f"Out-of-focus cells: {len(out_of_focus_cells)}")
-
-    # Cluster detection (in-focus only) ----------------
-    if len(in_focus_cells) > 1:
-        X = np.array([[c["x"], c["y"]] for c in in_focus_cells])
-        db = DBSCAN(eps=2.5 * max_sigma, min_samples=2).fit(X)
-        labels = db.labels_
-    else:
-        labels = np.array([-1] * len(in_focus_cells))
-
+    # Attach cluster labels to cells
     for c, lbl in zip(in_focus_cells, labels):
-        c["cluster"] = lbl
+        c["cluster"] = int(lbl)
 
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    print(f"Clusters detected (in-focus): {n_clusters}")
+    if debug:
+        print(f"Clusters detected: {n_clusters}")
 
-    # ---------------- Draw results ----------------
-    annotated = draw_cells_and_clusters(
-        img_rot_color,
+    # --------------------------------------------------
+    # Counting
+    # --------------------------------------------------
+    cluster_groups = {}
+    for c in in_focus_cells:
+        cluster_groups.setdefault(c["cluster"], []).append(c)
+
+    clusters = [v for k, v in cluster_groups.items() if k != -1]
+
+    counts = count_results(cells, clusters)
+
+    print("----- Results -----")
+    for k, v in counts.items():
+        print(f"{k}: {v}")
+
+    # --------------------------------------------------
+    # Visualization
+    # --------------------------------------------------
+    vis = draw_cells_and_clusters(
+        img_rot,
         in_focus_cells,
         out_of_focus_cells,
         draw_hulls=True
     )
 
-    # Visualization ----------------
-    plt.figure(figsize=(15, 5))
+    cv2.imshow("Cells & Clusters", vis)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
-    plt.subplot(1, 3, 1)
-    plt.imshow(gray_rot, cmap="gray")
-    plt.title("Rotated grayscale")
-    plt.axis("off")
+    return counts, vis
 
-    plt.subplot(1, 3, 2)
-    plt.imshow(response, cmap="inferno")
-    plt.title("LoG response map")
-    plt.axis("off")
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
-    plt.title("Cells & clusters")
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-# run main with appropriate sigma
-main(min_sigma = 2.0 , max_sigma=8.0)
+# run main
+main(
+    min_sigma=2.0,
+    max_sigma=8.0,
+    num_scales=10,
+    focus_sigma_thresh=4.5,
+    min_dist=6,
+    cluster_eps=18,
+    min_cluster_size=2,
+    debug=True
+)
