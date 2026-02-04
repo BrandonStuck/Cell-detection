@@ -59,26 +59,26 @@ def stripe_mask_from_rotated(gray_rot):
 
 #---------preprocess image--------------------
 def suppress_stripes(gray):
-    """
-    Remove horizontal stripe structure while preserving blobs.
-    """
-    # Estimate stripe background using a long horizontal blur
+    gray = gray.astype(np.float32)
+
     stripe_bg = cv2.GaussianBlur(gray, (1, 41), 0)
 
-    # Subtract background
-    out = gray - stripe_bg
+    # Prevent division explosions
+    stripe_bg[stripe_bg < 1] = 1
 
-    # Normalize safely
+    out = gray / stripe_bg
+
     out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX)
     return out.astype(np.uint8)
 
+
 def preprocess_for_cells(img_color, stripe_mask):
     """
-    Preprocessing for LoG-based cell detection.
-    Produces a smooth response-ready grayscale image.
+    Float-safe preprocessing for LoG cell detection.
+    Output: uint8 image, ready for LoG
     """
 
-    # 1. Convert to grayscale (green still helps, but weighted gray is safer)
+    # 1. Convert to grayscale
     if img_color.ndim == 3:
         gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
     else:
@@ -86,27 +86,70 @@ def preprocess_for_cells(img_color, stripe_mask):
 
     gray = gray.astype(np.float32)
 
-    # 2. Apply stripe mask early (critical)
-    gray = cv2.bitwise_and(gray, gray, mask=stripe_mask)
+    # 2. Apply stripe mask (FLOAT SAFE)
+    if stripe_mask is not None:
+        gray *= (stripe_mask.astype(np.float32) / 255.0)
+
+    # 3. Stripe suppression
     gray = suppress_stripes(gray)
 
-    # 3. Strong denoising without edge emphasis
-    #    (preserves blob centers)
+    # 4. Mild denoising (blob-preserving)
     gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.2, sigmaY=1.2)
 
-    # 4. Remove slow illumination background (heat-map flattening)
-    #    This is the *key* new step
-    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=18, sigmaY=18)
+    # 5. Remove slow illumination background (heat-map flattening)
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=20, sigmaY=20)
     gray = gray - background
 
-    # 5. Normalize to stable dynamic range
-    gray -= gray.min()
-    gray /= (gray.max() + 1e-6)
-    gray *= 255.0
+    # 6. Contrast normalization (FINAL)
+    lo, hi = np.percentile(gray, (1, 99))
+    gray = np.clip(gray, lo, hi)
+    gray = (gray - lo) / (hi - lo + 1e-6)
+    gray = (255 * gray).astype(np.uint8)
 
-    return gray.astype(np.uint8)
+    return gray
+
 
 #---------Heat Map--------------
+def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
+    """
+    Keep detections close to stripe centerlines.
+    max_dist: vertical distance (pixels) from stripe center
+    """
+    stripe_rows = np.where(stripe_mask.mean(axis=1) > 10)[0]
+    if len(stripe_rows) == 0:
+        return cells
+
+    gated = []
+    for c in cells:
+        y = c["y"]
+        if np.min(np.abs(stripe_rows - y)) <= max_dist:
+            gated.append(c)
+
+    return gated
+
+def reject_elongated(log_resp, anisotropy_thresh=3.0):
+    """
+    Suppress elongated (stripe-like) responses.
+    Keeps isotropic (cell-like) blobs.
+    """
+
+    # Force correct dtype for OpenCV
+    log_resp = log_resp.astype(np.float32)
+
+    gx = cv2.Sobel(log_resp, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(log_resp, cv2.CV_32F, 0, 1, ksize=3)
+
+    mag_x = np.abs(gx)
+    mag_y = np.abs(gy)
+
+    # Anisotropy ratio
+    ratio = (np.maximum(mag_x, mag_y) + 1e-6) / (np.minimum(mag_x, mag_y) + 1e-6)
+
+    # Suppress elongated structures
+    log_resp[ratio > anisotropy_thresh] = 0
+
+    return log_resp
+
 def detect_cells_log(pp, sigmas):
     """
     Pure detection.
@@ -122,9 +165,15 @@ def detect_cells_log(pp, sigmas):
         log = cv2.Laplacian(log, cv2.CV_32F)
         log = np.abs(log) * (sigma ** 2)
 
+        #suppress stripe-aligned structures
+        log = reject_elongated(log)
+
         mask = log > best_resp
         best_resp[mask] = log[mask]
         best_sigma[mask] = sigma
+
+    bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
+    log_norm = best_resp - bg
 
     # simple peak detection
     dilated = cv2.dilate(best_resp, np.ones((3, 3)))
@@ -145,6 +194,7 @@ def detect_cells_log(pp, sigmas):
 
 
     #Focus scoring
+
 def classify_focus(cells, sigma_thresh):
     """
     Labels cells as in-focus or out-of-focus.
@@ -155,7 +205,7 @@ def classify_focus(cells, sigma_thresh):
 
 #------------Merge Duplicated Circles--------------------
 
-def filter_min_distance(cells, min_dist):
+def filter_min_distance(cells, min_dist=50):
     kept = []
     for c in sorted(cells, key=lambda x: -x["response"]):
         if all(
@@ -340,12 +390,14 @@ def main(
     # --------------------------------------------------
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
-    sigmas = np.linspace(min_sigma, max_sigma, num_scales)
+    sigmas = np.arange(3.5, 8.5, 1.0)
     pp= 255 - gray
     cells = detect_cells_log(pp, sigmas)
 
     if debug:
         print(f"Raw detections: {len(cells)}")
+    cells = gate_by_stripe_centers(cells, stripe_mask, max_dist=15)
+    print("After stripe gating:", len(cells))
 
     # --------------------------------------------------
     # Focus classification (in / out)
@@ -408,6 +460,16 @@ def main(
     )
 
     cv2.imshow("Cells & Clusters", vis)
+    out_img = draw_cells_and_clusters(
+        img_rot,
+        in_focus_cells,
+        out_of_focus_cells,
+        draw_hulls=True
+    )
+
+    cv2.imwrite("cell_detection_result.png", out_img)
+    print("Saved: cell_detection_result.png")
+
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
