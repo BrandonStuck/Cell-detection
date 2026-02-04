@@ -4,6 +4,9 @@ import math
 import itertools
 import matplotlib.pyplot as plt
 from tkinter import Tk, filedialog
+from scipy.ndimage import gaussian_laplace
+from scipy.ndimage import maximum_filter
+from sklearn.cluster import DBSCAN
 
 #---------------Rotate Image-----------------
 #takes in grayscale, detects lines then estimates angle of rotation
@@ -55,310 +58,311 @@ def stripe_mask_from_rotated(gray_rot):
 
 
 #---------preprocess image--------------------
-def preprocess_for_cells(img, stripe_mask):
+def preprocess_for_cells(img_color, stripe_mask):
     """
-    Extracts the green channel, boosts rim contrast using CLAHE,
-    then applies Difference-of-Gaussians before masking.
+    Preprocessing for LoG-based cell detection.
+    Produces a smooth response-ready grayscale image.
     """
 
-    # 1. Use green channel (cell rims are most visible here)
-    gray = img[:, :, 1]
+    # 1. Convert to grayscale (green still helps, but weighted gray is safer)
+    if img_color.ndim == 3:
+        gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_color.copy()
 
-    # 2. Local contrast boost (pre-mask to avoid local context loss)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
+    gray = gray.astype(np.float32)
 
-    # 3. Apply stripe mask
-    masked = cv2.bitwise_and(gray, gray, mask=stripe_mask)
+    # 2. Apply stripe mask early (critical)
+    gray *= (stripe_mask > 0)
 
-    # 4. Difference of Gaussians (enhances soft circular rims)
-    blur_small = cv2.GaussianBlur(masked, (3,3), 0.5)
-    blur_large = cv2.GaussianBlur(masked, (9,9), 3)
-    dog = cv2.subtract(blur_small, blur_large)
+    # 3. Strong denoising without edge emphasis
+    #    (preserves blob centers)
+    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.2, sigmaY=1.2)
 
-    return dog
+    # 4. Remove slow illumination background (heat-map flattening)
+    #    This is the *key* new step
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=18, sigmaY=18)
+    gray = gray - background
 
-# ----------Circle Detection------------------
-def detect_hough_circles(cell_preprocessed, min_r, max_r):
-    # If the region has no content, skip
-    if np.count_nonzero(cell_preprocessed) < 50:
-        return []
+    # 5. Normalize to stable dynamic range
+    gray -= gray.min()
+    gray /= (gray.max() + 1e-6)
+    gray *= 255.0
 
-    circles = cv2.HoughCircles(
-        cell_preprocessed,
-        cv2.HOUGH_GRADIENT,
-        dp=1.2,
-        minDist=max(10, int(min_r * 1.2)),
-        param1=80,      # low Canny threshold
-        param2=20,       # VERY important: sensitive threshold for weak rims
-        minRadius=min_r,
-        maxRadius=max_r
-    )
+    return gray.astype(np.uint8)
 
-    if circles is None:
-        return []
+#---------Heat Map--------------
+def detect_cells_log(pp, sigmas):
+    """
+    Pure detection.
+    Returns raw LoG peaks with scale + response.
+    """
+    H, W = pp.shape
+    responses = []
+    best_sigma = np.zeros_like(pp, dtype=np.float32)
+    best_resp = np.zeros_like(pp, dtype=np.float32)
 
-    circles = np.int32(np.round(circles[0]))
-    return [(x, y, r) for (x, y, r) in circles]
+    for sigma in sigmas:
+        log = cv2.GaussianBlur(pp, (0, 0), sigma)
+        log = cv2.Laplacian(log, cv2.CV_32F)
+        log = np.abs(log) * (sigma ** 2)
 
-def detect_outer_contours(gray, min_r, max_r):
-    edges = cv2.Canny(gray, 25, 60)
-    edges = cv2.dilate(edges, None, iterations=1)
+        mask = log > best_resp
+        best_resp[mask] = log[mask]
+        best_sigma[mask] = sigma
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # simple peak detection
+    dilated = cv2.dilate(best_resp, np.ones((3, 3)))
+    peaks = (best_resp == dilated) & (best_resp > 0)
 
-    res = []
-    for cnt in contours:
-        (x, y), r = cv2.minEnclosingCircle(cnt)
-        r = int(r)
+    ys, xs = np.where(peaks)
+    for x, y in zip(xs, ys):
+        responses.append({
+            "x": int(x),
+            "y": int(y),
+            "sigma": float(best_sigma[y, x]),
+            "response": float(best_resp[y, x])
+        })
 
-        if r < min_r or r > max_r * 3:
-            continue
+    return responses
 
-        area = cv2.contourArea(cnt)
-        if area < 8:
-            continue
 
-        # circularity check
-        peri = cv2.arcLength(cnt, True)
-        if peri == 0:
-            continue
-
-        circ = 4 * math.pi * area / (peri * peri)
-        if circ > 0.55:
-            res.append((int(x), int(y), r))
-
-    return res
-
+    #Focus scoring
+def classify_focus(cells, sigma_thresh):
+    """
+    Labels cells as in-focus or out-of-focus.
+    """
+    for c in cells:
+        c["focus"] = "in" if c["sigma"] <= sigma_thresh else "out"
+    return cells
 
 #------------Merge Duplicated Circles--------------------
 
-def dedupe_color(gray, x, y, r):
-    """
-    Returns True if the circle at (x, y) with radius r appears to be a real droplet:
-    - Bright center
-    - Dark outer ring
-    """
-    num_samples = 20
-    center_values = []
-    outer_values = []
-
-    # sample center (half radius)
-    for t in np.linspace(0, 2*np.pi, num_samples):
-        px = int(x + 0.5*r*np.cos(t))
-        py = int(y + 0.5*r*np.sin(t))
-        if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
-            center_values.append(gray[py, px])
-    if not center_values:
-        return False
-    center_brightness = np.mean(center_values)
-
-    # sample outer ring (slightly outside radius)
-    for t in np.linspace(0, 2*np.pi, num_samples):
-        px = int(x + 1.1*r*np.cos(t))
-        py = int(y + 1.1*r*np.sin(t))
-        if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
-            outer_values.append(gray[py, px])
-    if not outer_values:
-        return False
-    ring_darkness = np.mean(outer_values)
-
-    # Real droplets: bright center + darker ring
-    return (center_brightness - ring_darkness) > 18  # adjust threshold as needed
-
-
-def dedupe_min_distance(circles, min_distance):
-    """
-    Removes circles that are too close to any other circle.
-    Only keeps circles that are at least `min_distance` apart.
-
-    circles: list of (x, y, r)
-    min_distance: minimum allowed distance between circle centers
-    """
-    filtered = []
-    for c in circles:
-        x, y, r = c
-        too_close = False
-        for fc in filtered:
-            fx, fy, fr = fc
-            d = math.hypot(x - fx, y - fy)
-            if d < min_distance:
-                too_close = True
-                break
-        if not too_close:
-            filtered.append(c)
-    return filtered
-
-def merge(circles, gray, min_distance):
-    """
-    Combines color-based validation and distance-based deduplication.
-
-    circles: list of (x, y, r)
-    gray: grayscale image
-    min_distance: minimum distance between circle centers
-    """
-
-    # Step 1: color / contrast filtering
-    color_filtered = []
-    for (x, y, r) in circles:
-        if dedupe_color(gray, x, y, r):
-            color_filtered.append((x, y, r))
-
-    # Step 2: spatial deduplication
-    final_circles = dedupe_min_distance(color_filtered, min_distance)
-
-    return final_circles
-
+def filter_min_distance(cells, min_dist):
+    kept = []
+    for c in sorted(cells, key=lambda x: -x["response"]):
+        if all(
+            math.hypot(c["x"] - k["x"], c["y"] - k["y"]) >= min_dist
+            for k in kept
+        ):
+            kept.append(c)
+    return kept
 
 # -------------Cluster Detection------------------------
-def circles_overlap(c1, c2, overlap_factor=1.65):
-
-    (x1, y1, r1) = c1
-    (x2, y2, r2) = c2
-    d = math.hypot(x1 - x2, y1 - y2)
-    # using edge-to-edge: overlap if center distance <= (r1 + r2) * overlap_factor
-
-    return d <= (r1 + r2) * overlap_factor
-
-
-def find_clusters_dbscan(circles, overlap_factor=1.65):
-    visited = set()
+def detect_clusters(cells, cluster_dist):
     clusters = []
+    used = set()
 
-    for i in range(len(circles)):
-        if i in visited:
+    for i, c in enumerate(cells):
+        if i in used:
             continue
+        cluster = [c]
+        used.add(i)
 
-        stack = [i]
-        cluster = []
-
-        while stack:
-            idx = stack.pop()
-            if idx in visited:
+        for j, o in enumerate(cells):
+            if j in used:
                 continue
-            visited.add(idx)
-            cluster.append(idx)
+            if math.hypot(c["x"] - o["x"], c["y"] - o["y"]) < cluster_dist:
+                cluster.append(o)
+                used.add(j)
 
-            # expand cluster by overlap
-            for j in range(len(circles)):
-                if j not in visited and circles_overlap(circles[idx], circles[j], overlap_factor):
-                    stack.append(j)
-
-        if len(cluster) > 1:
-            clusters.append(cluster)
+        clusters.append(cluster)
 
     return clusters
 
+def find_clusters_dbscan(cells, eps, min_samples=2):
+    """
+    cells: list of dicts with keys ['x', 'y', 'sigma', 'focus']
+    eps: clustering distance (in pixels)
+    min_samples: minimum cells to form a cluster
+
+    Returns:
+        labels: array of cluster labels (-1 = isolated cell)
+        n_clusters: number of clusters
+    """
+    if len(cells) == 0:
+        return np.array([]), 0
+
+    points = np.array([[c["x"], c["y"]] for c in cells])
+
+    db = DBSCAN(
+        eps=eps,
+        min_samples=min_samples,
+        metric="euclidean"
+    ).fit(points)
+
+    labels = db.labels_
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+
+    return labels, n_clusters
 
 #-----------------Circle Drawing------------------
-def draw_clusters_and_circles(base_img, unique_circles, clusters):
-    out = base_img.copy()
-    # draw all unique circles in green
-    for (x, y, r) in unique_circles:
-        cv2.circle(out, (int(x), int(y)), int(r), (0, 255, 0), 2)
-        cv2.circle(out, (int(x), int(y)), 2, (0, 255, 0), -1)
+def count_results(cells, clusters):
+    in_focus = [c for c in cells if c["focus"] == "in"]
+    out_focus = [c for c in cells if c["focus"] == "out"]
+    cluster_cells = sum(len(cl) for cl in clusters if len(cl) > 1)
 
-    # draw cluster members in red and connect them
-    for cid, cluster in enumerate(clusters, start=1):
-        color = (0, 0, 255)  # red
-        # draw lines between all pairs in cluster
-        for i, j in itertools.combinations(cluster, 2):
-            x1, y1, _ = unique_circles[i]
-            x2, y2, _ = unique_circles[j]
-            cv2.line(out, (int(x1), int(y1)), (int(x2), int(y2)), color, 2, cv2.LINE_AA)
-        # draw the circles again as red so they stand out
-        for i in cluster:
-            x, y, r = unique_circles[i]
-            cv2.circle(out, (int(x), int(y)), int(r), color, 2)
-            cv2.circle(out, (int(x), int(y)), 3, (0, 255, 255), -1)  # center marker
+    return {
+        "in_focus_cells": len(in_focus),
+        "out_of_focus_cells": len(out_focus),
+        "clusters": sum(1 for cl in clusters if len(cl) > 1),
+        "cells_in_clusters": cluster_cells
+    }
+
+
+def draw_cells_and_clusters(
+    base_img,
+    in_focus_cells,
+    out_of_focus_cells,
+    draw_hulls=True
+):
+    """
+    Draws:
+      - single in-focus cells (green)
+      - clustered in-focus cells (red)
+      - out-of-focus cells (blue)
+    """
+
+    out = base_img.copy()
+
+    # In-focus cells ----------
+    for c in in_focus_cells:
+        x, y = int(c["x"]), int(c["y"])
+        r = int(1.4 * c["sigma"])
+
+        if c["cluster"] == -1:
+            color = (0, 255, 0)      # green = single cell
+        else:
+            color = (0, 0, 255)      # red = clustered
+
+        cv2.circle(out, (x, y), r, color, 2)
+        cv2.circle(out, (x, y), 2, color, -1)
+
+    #  Out-of-focus cells ----------
+    for c in out_of_focus_cells:
+        x, y = int(c["x"]), int(c["y"])
+        r = int(1.4 * c["sigma"])
+
+        cv2.circle(out, (x, y), r, (255, 0, 0), 2)   # blue
+        cv2.circle(out, (x, y), 2, (255, 0, 0), -1)
+
+    # Cluster hulls (optional, recommended) ----------
+    if draw_hulls:
+        clusters = {}
+        for c in in_focus_cells:
+            lbl = c["cluster"]
+            if lbl == -1:
+                continue
+            clusters.setdefault(lbl, []).append((c["x"], c["y"]))
+
+        for pts in clusters.values():
+            if len(pts) < 3:
+                continue
+            pts = np.array(pts, dtype=np.int32)
+            hull = cv2.convexHull(pts)
+            cv2.polylines(out, [hull], True, (0, 0, 180), 2)
 
     return out
 
 
+
 #--------------Main---------------
-def main(min_r, max_r):
-    # select file
+def main(min_sigma=2.0, max_sigma=8.0):
+    #  File selection ----------------
     Tk().withdraw()
-    filename = filedialog.askopenfilename(title="Select an image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp")])
+    filename = filedialog.askopenfilename(
+        title="Select image",
+        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp")]
+    )
     if not filename:
         print("No file selected.")
         return
 
     img_color = cv2.imread(filename)
     if img_color is None:
-        print("Failed to open:", filename)
+        print("Failed to load image.")
         return
 
-    # estimate rotation and rotate
+    # Rotation ----------------
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
     angle = estimate_rotation_angle(gray)
     gray_rot = rotate_image(gray, -angle)
     img_rot_color = rotate_image(img_color, -angle)
 
-    # build stripe mask (used to focus detection to stripe areas)
+    #  Stripe mask ----------------
     mask_stripes = stripe_mask_from_rotated(gray_rot)
-    masked_gray = cv2.bitwise_and(gray_rot, gray_rot, mask=mask_stripes)
 
-    # --- detect circles ---
-    pp = preprocess_for_cells(img_color, mask_stripes)
-    hough_circles = detect_hough_circles(pp, min_r, max_r)
-    contour_circles = detect_outer_contours(pp, min_r, max_r)
-    combined = hough_circles + contour_circles
+    # Preprocessing ----------------
+    response = preprocess_for_cells(img_rot_color, mask_stripes)
 
-    # --- Filter real droplets --
-    real_circles = [c for c in combined if dedupe_color(gray_rot, *c)]
+    # LoG peak detection ----------------
+    cells = detect_cells_log(
+        response,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        threshold=0.02,
+        min_distance=6
+    )
 
-        # --- Step 1: color-based filtering ---
-    real_circles = [c for c in combined if dedupe_color(gray_rot, *c)]
-    print(f"Cells after color filter: {len(real_circles)}")
+    print(f"Candidate cells detected: {len(cells)}")
 
-        # --- Step 2: distance-based dedupe ---
-    if real_circles:
-        avg_r = np.mean([r for (_, _, r) in real_circles])
-        min_distance = 2.0 * avg_r
+    # Focus classification ----------------
+    cells = classify_focus(
+        response,
+        cells,
+        inner_scale=0.6,
+        outer_scale=1.6
+    )
+
+    # Split by focus ----------------
+    in_focus_cells = [c for c in cells if c["focus"] >= 0.25]
+    out_of_focus_cells = [c for c in cells if c["focus"] < 0.25]
+
+    print(f"In-focus cells: {len(in_focus_cells)}")
+    print(f"Out-of-focus cells: {len(out_of_focus_cells)}")
+
+    # Cluster detection (in-focus only) ----------------
+    if len(in_focus_cells) > 1:
+        X = np.array([[c["x"], c["y"]] for c in in_focus_cells])
+        db = DBSCAN(eps=2.5 * max_sigma, min_samples=2).fit(X)
+        labels = db.labels_
     else:
-        min_distance = 0
+        labels = np.array([-1] * len(in_focus_cells))
 
-    unique_circles = dedupe_min_distance(real_circles, min_distance)
+    for c, lbl in zip(in_focus_cells, labels):
+        c["cluster"] = lbl
 
-    print(f"Unique cells: {len(unique_circles)}")
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    print(f"Clusters detected (in-focus): {n_clusters}")
 
-    # Print detection counts
-    print(f"Hough detections: {len(hough_circles)}")
-    print(f"Contour detections: {len(contour_circles)}")
-    print(f"Unique circles (after dedupe): {len(unique_circles)}")
+    # ---------------- Draw results ----------------
+    annotated = draw_cells_and_clusters(
+        img_rot_color,
+        in_focus_cells,
+        out_of_focus_cells,
+        draw_hulls=True
+    )
 
-    # --- cluster detection
-    clusters = find_clusters_dbscan(unique_circles)
-    cluster_sizes = [len(c) for c in clusters]
-    print(f"Number of clusters (size>1): {len(clusters)}")
-    print("Cluster sizes:", cluster_sizes)
-
-    # draw annotated result
-    annotated = draw_clusters_and_circles(img_rot_color, unique_circles, clusters)
-
-    #Plot with 3 diagrams
-    plt.figure(figsize=(14, 5))
+    # Visualization ----------------
+    plt.figure(figsize=(15, 5))
 
     plt.subplot(1, 3, 1)
-    plt.imshow(gray_rot, cmap='gray')
+    plt.imshow(gray_rot, cmap="gray")
     plt.title("Rotated grayscale")
-    plt.axis('off')
+    plt.axis("off")
 
     plt.subplot(1, 3, 2)
-    plt.imshow(mask_stripes, cmap='gray')
-    plt.title("Stripe mask")
-    plt.axis('off')
+    plt.imshow(response, cmap="inferno")
+    plt.title("LoG response map")
+    plt.axis("off")
 
     plt.subplot(1, 3, 3)
-    # convert BGR to RGB for matplotlib
     plt.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
-    plt.title("Detected Clusters & Connections")
-    plt.axis('off')
+    plt.title("Cells & clusters")
+    plt.axis("off")
 
     plt.tight_layout()
     plt.show()
 
-
-# run main with provided min/max radii
-main(min_r=12, max_r=30)
+# run main with appropriate sigma
+main(min_sigma = 2.0 , max_sigma=8.0)
