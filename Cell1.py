@@ -58,6 +58,20 @@ def stripe_mask_from_rotated(gray_rot):
 
 
 #---------preprocess image--------------------
+def suppress_stripes(gray):
+    """
+    Remove horizontal stripe structure while preserving blobs.
+    """
+    # Estimate stripe background using a long horizontal blur
+    stripe_bg = cv2.GaussianBlur(gray, (1, 41), 0)
+
+    # Subtract background
+    out = gray - stripe_bg
+
+    # Normalize safely
+    out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX)
+    return out.astype(np.uint8)
+
 def preprocess_for_cells(img_color, stripe_mask):
     """
     Preprocessing for LoG-based cell detection.
@@ -73,7 +87,8 @@ def preprocess_for_cells(img_color, stripe_mask):
     gray = gray.astype(np.float32)
 
     # 2. Apply stripe mask early (critical)
-    gray *= (stripe_mask > 0)
+    gray = cv2.bitwise_and(gray, gray, mask=stripe_mask)
+    gray = suppress_stripes(gray)
 
     # 3. Strong denoising without edge emphasis
     #    (preserves blob centers)
@@ -113,7 +128,9 @@ def detect_cells_log(pp, sigmas):
 
     # simple peak detection
     dilated = cv2.dilate(best_resp, np.ones((3, 3)))
-    peaks = (best_resp == dilated) & (best_resp > 0)
+    # Robust response threshold (percentile-based)
+    thr = np.percentile(best_resp, 99.7)  # start here
+    peaks = (best_resp == dilated) & (best_resp > thr)
 
     ys, xs = np.where(peaks)
     for x, y in zip(xs, ys):
@@ -265,6 +282,19 @@ def draw_cells_and_clusters(
     return out
 
 
+#----Image Select------
+def pick_image_file():
+    root = Tk()
+    root.withdraw()  # hide empty tkinter window
+    file_path = filedialog.askopenfilename(
+        title="Select cell image",
+        filetypes=[
+            ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff"),
+            ("All files", "*.*")
+        ]
+    )
+    root.destroy()
+    return file_path
 
 #--------------Main---------------
 def main(
@@ -281,11 +311,12 @@ def main(
     # Load image
     # --------------------------------------------------
 
-    image_path = input("Enter image path: ").strip()
+    image_path = pick_image_file()
 
     img_color = cv2.imread(image_path)
-    if img_color is None:
-        raise FileNotFoundError(f"Could not load image: {image_path}")
+    if not image_path:
+        print("No file selected. Exiting.")
+        return
 
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
@@ -310,6 +341,7 @@ def main(
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
     sigmas = np.linspace(min_sigma, max_sigma, num_scales)
+    pp= 255 - gray
     cells = detect_cells_log(pp, sigmas)
 
     if debug:
