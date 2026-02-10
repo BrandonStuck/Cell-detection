@@ -110,22 +110,33 @@ def preprocess_for_cells(img_color, stripe_mask):
 
 
 #---------Heat Map--------------
-def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
-    """
-    Keep detections close to stripe centerlines.
-    max_dist: vertical distance (pixels) from stripe center
-    """
-    stripe_rows = np.where(stripe_mask.mean(axis=1) > 10)[0]
-    if len(stripe_rows) == 0:
-        return cells
+def stripe_centerlines(stripe_mask, row_thresh=10):
+    rows = np.where(stripe_mask.mean(axis=1) > row_thresh)[0]
+    if len(rows) == 0:
+        return np.array([], dtype=int)
 
+    centers = []
+    start = rows[0]
+    prev = rows[0]
+    for r in rows[1:]:
+        if r == prev + 1:
+            prev = r
+        else:
+            centers.append((start + prev) // 2)
+            start = prev = r
+    centers.append((start + prev) // 2)
+    return np.array(centers, dtype=int)
+
+def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
+    centers = stripe_centerlines(stripe_mask)
+    if len(centers) == 0:
+        return cells
     gated = []
     for c in cells:
-        y = c["y"]
-        if np.min(np.abs(stripe_rows - y)) <= max_dist:
+        if np.min(np.abs(centers - c["y"])) <= max_dist:
             gated.append(c)
-
     return gated
+
 
 def reject_elongated(log_resp, anisotropy_thresh=3.0):
     """
@@ -151,35 +162,31 @@ def reject_elongated(log_resp, anisotropy_thresh=3.0):
     return log_resp
 
 def detect_cells_log(pp, sigmas):
-    """
-    Pure detection.
-    Returns raw LoG peaks with scale + response.
-    """
-    H, W = pp.shape
     responses = []
     best_sigma = np.zeros_like(pp, dtype=np.float32)
     best_resp = np.zeros_like(pp, dtype=np.float32)
 
+    pp32 = pp.astype(np.float32)
+
     for sigma in sigmas:
-        log = cv2.GaussianBlur(pp, (0, 0), sigma)
+        log = cv2.GaussianBlur(pp32, (0, 0), sigma)
         log = cv2.Laplacian(log, cv2.CV_32F)
         log = np.abs(log) * (sigma ** 2)
 
-        #suppress stripe-aligned structures
         log = reject_elongated(log)
 
         mask = log > best_resp
         best_resp[mask] = log[mask]
         best_sigma[mask] = sigma
 
+    # local background subtraction
     bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
     log_norm = best_resp - bg
 
-    # simple peak detection
-    dilated = cv2.dilate(best_resp, np.ones((3, 3)))
-    # Robust response threshold (percentile-based)
-    thr = np.percentile(best_resp, 99.7)  # start here
-    peaks = (best_resp == dilated) & (best_resp > thr)
+    # peak detection on log_norm (NOT best_resp)
+    dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
+    thr = np.percentile(log_norm, 99.7)
+    peaks = (log_norm == dilated) & (log_norm > thr)
 
     ys, xs = np.where(peaks)
     for x, y in zip(xs, ys):
@@ -187,7 +194,7 @@ def detect_cells_log(pp, sigmas):
             "x": int(x),
             "y": int(y),
             "sigma": float(best_sigma[y, x]),
-            "response": float(best_resp[y, x])
+            "response": float(log_norm[y, x])   # use normalized response
         })
 
     return responses
@@ -390,8 +397,9 @@ def main(
     # --------------------------------------------------
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
+    pp = 255 - pp
     sigmas = np.arange(3.5, 8.5, 1.0)
-    pp= 255 - gray
+
     cells = detect_cells_log(pp, sigmas)
 
     if debug:
@@ -402,6 +410,9 @@ def main(
     # --------------------------------------------------
     # Focus classification (in / out)
     # --------------------------------------------------
+    sig = np.array([c["sigma"] for c in cells], dtype=float)
+    print(f"sigma stats: min={sig.min():.2f} med={np.median(sig):.2f} max={sig.max():.2f}")
+
     cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
 
     # --------------------------------------------------
