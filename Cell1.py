@@ -147,13 +147,11 @@ def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
             gated.append(c)
     return gated
 
-def reject_elongated(log_resp, anisotropy_thresh=3.0):
+def reject_elongated(log_resp, anisotropy_thresh=2.0):
     """
     Suppress elongated (stripe-like) responses.
     Keeps isotropic (cell-like) blobs.
     """
-
-    # Force correct dtype for OpenCV
     log_resp = log_resp.astype(np.float32)
 
     gx = cv2.Sobel(log_resp, cv2.CV_32F, 1, 0, ksize=3)
@@ -162,13 +160,11 @@ def reject_elongated(log_resp, anisotropy_thresh=3.0):
     mag_x = np.abs(gx)
     mag_y = np.abs(gy)
 
-    # Anisotropy ratio
     ratio = (np.maximum(mag_x, mag_y) + 1e-6) / (np.minimum(mag_x, mag_y) + 1e-6)
 
-    # Suppress elongated structures
     log_resp[ratio > anisotropy_thresh] = 0
-
     return log_resp
+
 
 def detect_cells_log(pp, sigmas):
     responses = []
@@ -194,7 +190,7 @@ def detect_cells_log(pp, sigmas):
 
     # peak detection on log_norm (NOT best_resp)
     dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, 99.85)
+    thr = np.percentile(log_norm, 99.9)
     peaks = (log_norm == dilated) & (log_norm > thr)
 
     ys, xs = np.where(peaks)
@@ -407,16 +403,19 @@ def main(
     # --------------------------------------------------
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
-    pp = 255 - pp
-    sigmas = np.arange(4.0, 10.0, 1.0)
 
+    pp = 255 - pp
+    sigmas = np.arange(3.0, 7.5, 0.5)
 
     cells = detect_cells_log(pp, sigmas)
-    cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
-
     if debug:
-        print(f"Raw detections: {len(cells)}")
-    cells = gate_by_stripe_centers(cells, stripe_mask, max_dist=15)
+        print(f"Raw detections (pre-valid): {len(cells)}")
+
+    cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
+    if debug:
+        print(f"After valid-mask gate: {len(cells)}")
+
+    cells = gate_by_stripe_centers(cells, stripe_mask, max_dist=8)
     print("After stripe gating:", len(cells))
 
     # --------------------------------------------------
