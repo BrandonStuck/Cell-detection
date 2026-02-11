@@ -41,6 +41,7 @@ def rotate_image(img, angle, border_value=0):
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=border_value
     )
+
 def rotated_valid_mask(shape_hw, angle):
     h, w = shape_hw
     ones = np.ones((h, w), dtype=np.uint8) * 255
@@ -113,7 +114,7 @@ def preprocess_for_cells(img_color, stripe_mask):
     gray = gray - background
 
     # 6. Contrast normalization (FINAL)
-    lo, hi = np.percentile(gray, (1, 99))
+    lo, hi = np.percentile(gray, (1, 98.5))
     gray = np.clip(gray, lo, hi)
     gray = (gray - lo) / (hi - lo + 1e-6)
     gray = (255 * gray).astype(np.uint8)
@@ -165,6 +166,23 @@ def reject_elongated(log_resp, anisotropy_thresh=2.0):
     log_resp[ratio > anisotropy_thresh] = 0
     return log_resp
 
+def gate_by_valid_interior(cells, valid_mask, margin=20):
+    """
+    Remove detections near rotation border by eroding the valid mask.
+    margin = pixels of safety distance from invalid border.
+    """
+    if valid_mask is None:
+        return cells
+
+    k = 2 * margin + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    interior = cv2.erode((valid_mask > 0).astype(np.uint8), kernel, iterations=1)
+
+    out = []
+    for c in cells:
+        if interior[c["y"], c["x"]] > 0:
+            out.append(c)
+    return out
 
 def detect_cells_log(pp, sigmas):
     responses = []
@@ -190,7 +208,7 @@ def detect_cells_log(pp, sigmas):
 
     # peak detection on log_norm (NOT best_resp)
     dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, 99.9)
+    thr = np.percentile(log_norm, 99.7)
     peaks = (log_norm == dilated) & (log_norm > thr)
 
     ys, xs = np.where(peaks)
@@ -217,13 +235,22 @@ def classify_focus(cells, sigma_thresh):
 
 #------------Merge Duplicated Circles--------------------
 
-def filter_min_distance(cells, min_dist=50):
+def filter_min_distance(cells, k=2.2):
     kept = []
+    # keep strongest responses first
     for c in sorted(cells, key=lambda x: -x["response"]):
-        if all(
-            math.hypot(c["x"] - k["x"], c["y"] - k["y"]) >= min_dist
-            for k in kept
-        ):
+        x, y, s = c["x"], c["y"], c["sigma"]
+        ok = True
+        for kpt in kept:
+            dx = x - kpt["x"]
+            dy = y - kpt["y"]
+            d2 = dx * dx + dy * dy
+            # suppression radius based on the larger sigma
+            rad = k * max(s, kpt["sigma"])
+            if d2 < rad * rad:
+                ok = False
+                break
+        if ok:
             kept.append(c)
     return kept
 
@@ -274,6 +301,25 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
 
     return labels, n_clusters
+def nms_within_clusters(cells, labels, k=2.2):
+    """
+    Run scale-aware NMS inside each DBSCAN cluster separately.
+    Keeps clusters intact while removing duplicate peaks per cell.
+    """
+    # group indices by label
+    groups = {}
+    for idx, lbl in enumerate(labels):
+        groups.setdefault(int(lbl), []).append(idx)
+
+    kept = []
+    for lbl, idxs in groups.items():
+        # run NMS on this group only
+        group_cells = [cells[i] for i in idxs]
+        group_cells = filter_min_distance(group_cells, k=k)
+        kept.extend(group_cells)
+
+    return kept
+
 
 #-----------------Circle Drawing------------------
 def count_results(cells, clusters):
@@ -319,7 +365,7 @@ def draw_cells_and_clusters(
     #  Out-of-focus cells ----------
     for c in out_of_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(2.8 * c["sigma"])
+        r = int(3.4 * c["sigma"])
 
         cv2.circle(out, (x, y), r, (255, 0, 0), 2)   # blue
         cv2.circle(out, (x, y), 2, (255, 0, 0), -1)
@@ -359,7 +405,7 @@ def pick_image_file():
 
 #--------------Main---------------
 def main(
-    min_sigma=2.0,
+    min_sigma=5.0,
     max_sigma=8.0,
     num_scales=10,
     focus_sigma_thresh=4.5,
@@ -405,13 +451,16 @@ def main(
     # --------------------------------------------------
 
     pp = 255 - pp
-    sigmas = np.arange(3.0, 7.5, 0.5)
+    sigmas = np.arange(4.5, 11.0, 0.7)
+    min_sigma_keep = 4.0
 
     cells = detect_cells_log(pp, sigmas)
     if debug:
         print(f"Raw detections (pre-valid): {len(cells)}")
 
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
+    cells = gate_by_valid_interior(cells, valid, margin=25)  # try 20–40
+
     if debug:
         print(f"After valid-mask gate: {len(cells)}")
 
@@ -431,8 +480,8 @@ def main(
     # --------------------------------------------------
     # Non-maximum suppression (merge duplicates)
     # --------------------------------------------------
-    min_dist = int(1.5 * np.median([c["sigma"] for c in cells]))
-    cells = filter_min_distance(cells, min_dist=min_dist)
+    cells = filter_min_distance(cells, k=2.4)
+
 
     if debug:
         print(f"After min-distance filtering: {len(cells)}")
@@ -440,27 +489,32 @@ def main(
     # --------------------------------------------------
     # Separate in-focus vs out-of-focus
     # --------------------------------------------------
+    # Focus classification
+    cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
+
+    # Separate
     in_focus_cells = [c for c in cells if c["focus"] == "in"]
     out_of_focus_cells = [c for c in cells if c["focus"] == "out"]
 
-    # --------------------------------------------------
-    # Cluster detection (DBSCAN on in-focus only)
-    # --------------------------------------------------
-    median_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
-    cluster_eps = 3.0 * median_sigma
-
+    # DBSCAN first (on in-focus candidates)
     labels, n_clusters = find_clusters_dbscan(
         in_focus_cells,
         eps=cluster_eps,
         min_samples=min_cluster_size
     )
 
-    # Attach cluster labels to cells
+    # Attach cluster labels
     for c, lbl in zip(in_focus_cells, labels):
         c["cluster"] = int(lbl)
 
-    if debug:
-        print(f"Clusters detected: {n_clusters}")
+    # NOW remove duplicates without breaking clusters
+    in_focus_cells = nms_within_clusters(in_focus_cells, labels, k=2.4)
+
+    # If you also want NMS on out-of-focus (optional)
+    out_of_focus_cells = filter_min_distance(out_of_focus_cells, k=2.4)
+
+    # Recombine if you need a unified list for counting
+    cells = in_focus_cells + out_of_focus_cells
 
     # --------------------------------------------------
     # Counting
@@ -505,7 +559,7 @@ def main(
 
 # run main
 main(
-    min_sigma=2.0,
+    min_sigma=5.0,
     max_sigma=8.0,
     num_scales=10,
     focus_sigma_thresh=4.5,
