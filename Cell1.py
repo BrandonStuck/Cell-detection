@@ -32,12 +32,26 @@ def estimate_rotation_angle(imGray, debug=False):
         print("Estimated stripe angle:", angle_med)
     return angle_med
 
-def rotate_image(img, angle):
+def rotate_image(img, angle, border_value=0):
     h, w = img.shape[:2]
     M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-
+    return cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border_value
+    )
+def rotated_valid_mask(shape_hw, angle):
+    h, w = shape_hw
+    ones = np.ones((h, w), dtype=np.uint8) * 255
+    M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+    valid = cv2.warpAffine(
+        ones, M, (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    return valid
 #-----------------Mask--------------------
 def stripe_mask_from_rotated(gray_rot):
     blur = cv2.GaussianBlur(gray_rot, (7, 7), 2)
@@ -56,7 +70,6 @@ def stripe_mask_from_rotated(gray_rot):
             mask[labels == i] = 255
     return mask
 
-
 #---------preprocess image--------------------
 def suppress_stripes(gray):
     gray = gray.astype(np.float32)
@@ -70,7 +83,6 @@ def suppress_stripes(gray):
 
     out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX)
     return out.astype(np.uint8)
-
 
 def preprocess_for_cells(img_color, stripe_mask):
     """
@@ -107,8 +119,6 @@ def preprocess_for_cells(img_color, stripe_mask):
     gray = (255 * gray).astype(np.uint8)
 
     return gray
-
-
 #---------Heat Map--------------
 def stripe_centerlines(stripe_mask, row_thresh=10):
     rows = np.where(stripe_mask.mean(axis=1) > row_thresh)[0]
@@ -136,7 +146,6 @@ def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
         if np.min(np.abs(centers - c["y"])) <= max_dist:
             gated.append(c)
     return gated
-
 
 def reject_elongated(log_resp, anisotropy_thresh=3.0):
     """
@@ -283,7 +292,6 @@ def count_results(cells, clusters):
         "cells_in_clusters": cluster_cells
     }
 
-
 def draw_cells_and_clusters(
     base_img,
     in_focus_cells,
@@ -369,7 +377,7 @@ def main(
     # --------------------------------------------------
 
     image_path = pick_image_file()
-    min_dist = int(1.5 * np.median([c["sigma"] for c in cells]))
+
 
     img_color = cv2.imread(image_path)
     if not image_path:
@@ -382,17 +390,18 @@ def main(
     # Estimate rotation + rotate
     # --------------------------------------------------
     angle = estimate_rotation_angle(gray, debug=debug)
-    img_rot = rotate_image(img_color, angle)
+
+    img_rot = rotate_image(img_color, angle, border_value=(0, 0, 0))
     gray_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
 
-    # --------------------------------------------------
-    # Stripe mask (on rotated image)
-    # --------------------------------------------------
-    stripe_mask = stripe_mask_from_rotated(gray_rot)
+    valid = rotated_valid_mask(gray.shape, angle)  # 255 where pixels are real
 
     # --------------------------------------------------
     # Preprocessing → response-ready image
     # --------------------------------------------------
+    stripe_mask = stripe_mask_from_rotated(gray_rot)
+    stripe_mask = cv2.bitwise_and(stripe_mask, valid)  # keep only valid region
+
     pp = preprocess_for_cells(img_rot, stripe_mask)
 
     # --------------------------------------------------
@@ -403,6 +412,7 @@ def main(
 
 
     cells = detect_cells_log(pp, sigmas)
+    cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
 
     if debug:
         print(f"Raw detections: {len(cells)}")
@@ -422,6 +432,7 @@ def main(
     # --------------------------------------------------
     # Non-maximum suppression (merge duplicates)
     # --------------------------------------------------
+    min_dist = int(1.5 * np.median([c["sigma"] for c in cells]))
     cells = filter_min_distance(cells, min_dist=min_dist)
 
     if debug:
