@@ -194,7 +194,7 @@ def detect_cells_log(pp, sigmas):
 
     # peak detection on log_norm (NOT best_resp)
     dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, 99.7)
+    thr = np.percentile(log_norm, 99.85)
     peaks = (log_norm == dilated) & (log_norm > thr)
 
     ys, xs = np.where(peaks)
@@ -310,7 +310,7 @@ def draw_cells_and_clusters(
     # In-focus cells ----------
     for c in in_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(1.4 * c["sigma"])
+        r = int(2.8 * c["sigma"])
 
         if c["cluster"] == -1:
             color = (0, 255, 0)      # green = single cell
@@ -323,7 +323,7 @@ def draw_cells_and_clusters(
     #  Out-of-focus cells ----------
     for c in out_of_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(1.4 * c["sigma"])
+        r = int(2.8 * c["sigma"])
 
         cv2.circle(out, (x, y), r, (255, 0, 0), 2)   # blue
         cv2.circle(out, (x, y), 2, (255, 0, 0), -1)
@@ -408,7 +408,7 @@ def main(
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
     pp = 255 - pp
-    sigmas = np.arange(4.5, 10.5, 1.0)
+    sigmas = np.arange(4.0, 10.0, 1.0)
 
 
     cells = detect_cells_log(pp, sigmas)
