@@ -369,6 +369,7 @@ def main(
     # --------------------------------------------------
 
     image_path = pick_image_file()
+    min_dist = int(1.5 * np.median([c["sigma"] for c in cells]))
 
     img_color = cv2.imread(image_path)
     if not image_path:
@@ -398,7 +399,8 @@ def main(
     # Multi-scale LoG detection (PURE detection)
     # --------------------------------------------------
     pp = 255 - pp
-    sigmas = np.arange(3.5, 8.5, 1.0)
+    sigmas = np.arange(4.5, 10.5, 1.0)
+
 
     cells = detect_cells_log(pp, sigmas)
 
@@ -411,6 +413,8 @@ def main(
     # Focus classification (in / out)
     # --------------------------------------------------
     sig = np.array([c["sigma"] for c in cells], dtype=float)
+    focus_sigma_thresh = np.percentile(sig, 60)  # top ~60% sharpest as "in"
+
     print(f"sigma stats: min={sig.min():.2f} med={np.median(sig):.2f} max={sig.max():.2f}")
 
     cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
@@ -432,6 +436,9 @@ def main(
     # --------------------------------------------------
     # Cluster detection (DBSCAN on in-focus only)
     # --------------------------------------------------
+    median_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
+    cluster_eps = 3.0 * median_sigma
+
     labels, n_clusters = find_clusters_dbscan(
         in_focus_cells,
         eps=cluster_eps,
