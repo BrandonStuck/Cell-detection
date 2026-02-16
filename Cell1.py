@@ -8,6 +8,13 @@ from scipy.ndimage import gaussian_laplace
 from scipy.ndimage import maximum_filter
 from sklearn.cluster import DBSCAN
 
+"""
+To do:
+    1) Refine 20x images
+    2) Add option for 10x and 4x (doesnt have to be too reliable, just adjust parameters)
+    3) Turn on voltage
+    4) Prepare script to run on laptop (interface, folders)"""
+
 #---------------Rotate Image-----------------
 #takes in grayscale, detects lines then estimates angle of rotation
 def estimate_rotation_angle(imGray, debug=False):
@@ -121,6 +128,48 @@ def preprocess_for_cells(img_color, stripe_mask):
 
     return gray
 #---------Heat Map--------------
+def detect_cells_log(pp, sigmas):
+    responses = []
+    best_sigma = np.zeros_like(pp, dtype=np.float32)
+    best_resp = np.zeros_like(pp, dtype=np.float32)
+
+    pp32 = pp.astype(np.float32)
+
+    for sigma in sigmas:
+        log = cv2.GaussianBlur(pp32, (0, 0), sigma)
+        log = cv2.Laplacian(log, cv2.CV_32F)
+        log = np.abs(log) * (sigma ** 2)
+
+        log = reject_elongated(log)
+
+        mask = log > best_resp
+        best_resp[mask] = log[mask]
+        best_sigma[mask] = sigma
+
+    # local background subtraction
+    bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
+    log_norm = best_resp - bg
+
+    # peak detection on log_norm (NOT best_resp)
+    dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
+    thr = np.percentile(log_norm, 99.7)
+    peaks = (log_norm == dilated) & (log_norm > thr)
+
+    ys, xs = np.where(peaks)
+    for x, y in zip(xs, ys):
+        responses.append({
+            "x": int(x),
+            "y": int(y),
+            "sigma": float(best_sigma[y, x]),
+            "response": float(log_norm[y, x])   # use normalized response
+        })
+
+    return responses
+
+
+    #Focus scoring
+
+#-------Filtering-----------------
 def stripe_centerlines(stripe_mask, row_thresh=10):
     rows = np.where(stripe_mask.mean(axis=1) > row_thresh)[0]
     if len(rows) == 0:
@@ -184,47 +233,6 @@ def gate_by_valid_interior(cells, valid_mask, margin=20):
             out.append(c)
     return out
 
-def detect_cells_log(pp, sigmas):
-    responses = []
-    best_sigma = np.zeros_like(pp, dtype=np.float32)
-    best_resp = np.zeros_like(pp, dtype=np.float32)
-
-    pp32 = pp.astype(np.float32)
-
-    for sigma in sigmas:
-        log = cv2.GaussianBlur(pp32, (0, 0), sigma)
-        log = cv2.Laplacian(log, cv2.CV_32F)
-        log = np.abs(log) * (sigma ** 2)
-
-        log = reject_elongated(log)
-
-        mask = log > best_resp
-        best_resp[mask] = log[mask]
-        best_sigma[mask] = sigma
-
-    # local background subtraction
-    bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
-    log_norm = best_resp - bg
-
-    # peak detection on log_norm (NOT best_resp)
-    dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, 99.7)
-    peaks = (log_norm == dilated) & (log_norm > thr)
-
-    ys, xs = np.where(peaks)
-    for x, y in zip(xs, ys):
-        responses.append({
-            "x": int(x),
-            "y": int(y),
-            "sigma": float(best_sigma[y, x]),
-            "response": float(log_norm[y, x])   # use normalized response
-        })
-
-    return responses
-
-
-    #Focus scoring
-
 def classify_focus(cells, sigma_thresh):
     """
     Labels cells as in-focus or out-of-focus.
@@ -232,8 +240,6 @@ def classify_focus(cells, sigma_thresh):
     for c in cells:
         c["focus"] = "in" if c["sigma"] <= sigma_thresh else "out"
     return cells
-
-#------------Merge Duplicated Circles--------------------
 
 def filter_min_distance(cells, k=2.2):
     kept = []
@@ -301,6 +307,7 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
 
     return labels, n_clusters
+
 def nms_within_clusters(cells, labels, k=2.2):
     """
     Run scale-aware NMS inside each DBSCAN cluster separately.
@@ -319,7 +326,6 @@ def nms_within_clusters(cells, labels, k=2.2):
         kept.extend(group_cells)
 
     return kept
-
 
 #-----------------Circle Drawing------------------
 def count_results(cells, clusters):
