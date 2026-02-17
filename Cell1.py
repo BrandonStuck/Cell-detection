@@ -15,6 +15,38 @@ To do:
     3) Turn on voltage
     4) Prepare script to run on laptop (interface, folders)"""
 
+MAG_CONFIGS = {
+    "20x": {
+        "radius_px": (10, 22),     # <-- tune once with one good image
+        "peak_percentile": 99.6,
+        "stripe_gate_dist": 15,
+        "border_margin": 10,
+        "nms_k": 2.6,
+        "cluster_eps_mult": 3.0,   # eps = mult * median_sigma
+    },
+    "10x": {
+        "radius_px": (6, 14),
+        "peak_percentile": 99.6,
+        "stripe_gate_dist": 15,
+        "border_margin": 10,
+        "nms_k": 2.6,
+        "cluster_eps_mult": 3.0,
+    },
+    "4x": {
+        "radius_px": (3, 9),
+        "peak_percentile": 99.7,
+        "stripe_gate_dist": 15,
+        "border_margin": 10,
+        "nms_k": 2.6,
+        "cluster_eps_mult": 3.0,
+    },
+}
+def sigmas_from_radius(radius_range, step=0.8):
+    rmin, rmax = radius_range
+    smin = rmin / 2.8
+    smax = rmax / 2.8
+    return np.arange(smin, smax + 1e-6, step)
+
 #---------------Rotate Image-----------------
 #takes in grayscale, detects lines then estimates angle of rotation
 def estimate_rotation_angle(imGray, debug=False):
@@ -420,6 +452,9 @@ def main(
     min_cluster_size=2,
     debug=True
 ):
+    mag = "20x"
+    cfg = MAG_CONFIGS[mag]
+    sigmas = sigmas_from_radius(cfg["radius_px"], step=0.8)
     # --------------------------------------------------
     # Load image
     # --------------------------------------------------
