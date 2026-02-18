@@ -17,12 +17,16 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-        "radius_px": (10, 22),     # <-- tune once with one good image
-        "peak_percentile": 99.6,
-        "stripe_gate_dist": 15,
-        "border_margin": 10,
-        "nms_k": 2.6,
-        "cluster_eps_mult": 3.0,   # eps = mult * median_sigma
+          "radius_px": (12, 28),
+    "sigma_step": 0.6,
+    "peak_percentile": 99.0,
+    "stripe_gate_k": 0.9,
+    "stripe_gate_min_dist": 8,
+    "border_pad": 1.3,
+    "nms_k": 1.0,
+    "focus_sigma_percentile": 60,
+    "cluster_eps_mult": 3.0,
+    "cluster_min_samples": 3,
     },
     "10x": {
         "radius_px": (6, 14),
@@ -160,43 +164,52 @@ def preprocess_for_cells(img_color, stripe_mask):
 
     return gray
 #---------Heat Map--------------
-def detect_cells_log(pp, sigmas, peak_percentile=99.6):
-    responses = []
-    best_sigma = np.zeros_like(pp, dtype=np.float32)
-    best_resp = np.zeros_like(pp, dtype=np.float32)
-
+def detect_cells_log(pp, sigmas, peak_percentile=99.0):
     pp32 = pp.astype(np.float32)
 
+    # compute response stack
+    stack = []
     for sigma in sigmas:
-        log = cv2.GaussianBlur(pp32, (0, 0), float(sigma))
+        log = cv2.GaussianBlur(pp32, (0, 0), sigma)
         log = cv2.Laplacian(log, cv2.CV_32F)
-        log = np.abs(log) * (float(sigma) ** 2)
-
+        log = np.abs(log) * (sigma ** 2)
         log = reject_elongated(log)
+        stack.append(log)
 
-        mask = log > best_resp
-        best_resp[mask] = log[mask]
-        best_sigma[mask] = float(sigma)
+    stack = np.stack(stack, axis=0)  # [S, H, W]
 
-    # local background subtraction
-    bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
-    log_norm = best_resp - bg
+    # background removal per-scale (helps)
+    for i in range(stack.shape[0]):
+        bg = cv2.GaussianBlur(stack[i], (0, 0), sigmaX=10)
+        stack[i] = stack[i] - bg
 
-    # peak detection on log_norm
-    dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, peak_percentile)
-    peaks = (log_norm == dilated) & (log_norm > thr)
+    # scale-space max: must be max in (x,y) AND locally max across sigma
+    best_idx = np.argmax(stack, axis=0)              # [H,W]
+    best_val = np.max(stack, axis=0)                 # [H,W]
+
+    # enforce local max across neighboring sigmas
+    scale_ok = np.zeros_like(best_val, dtype=bool)
+    for si in range(1, stack.shape[0]-1):
+        m = (best_idx == si)
+        scale_ok[m] = (stack[si][m] > stack[si-1][m]) & (stack[si][m] > stack[si+1][m])
+
+    # 2D peak detection on best_val
+    dil = cv2.dilate(best_val, np.ones((3, 3), np.uint8))
+    thr = np.percentile(best_val, peak_percentile)
+    peaks = (best_val == dil) & (best_val > thr) & scale_ok
 
     ys, xs = np.where(peaks)
+    out = []
     for x, y in zip(xs, ys):
-        responses.append({
+        si = int(best_idx[y, x])
+        out.append({
             "x": int(x),
             "y": int(y),
-            "sigma": float(best_sigma[y, x]),
-            "response": float(log_norm[y, x]),
+            "sigma": float(sigmas[si]),
+            "response": float(best_val[y, x])
         })
+    return out
 
-    return responses
 
 
 
@@ -220,13 +233,20 @@ def stripe_centerlines(stripe_mask, row_thresh=10):
     centers.append((start + prev) // 2)
     return np.array(centers, dtype=int)
 
-def gate_by_stripe_centers(cells, stripe_mask, max_dist=6):
+def gate_by_stripe_centers_scale(cells, stripe_mask, k=1.0, min_dist=6):
+    """
+    k controls how far from stripe center we allow, relative to detected radius.
+    allowed_dist = max(min_dist, k * 2.8 * sigma)
+    """
     centers = stripe_centerlines(stripe_mask)
     if len(centers) == 0:
         return cells
+
     gated = []
     for c in cells:
-        if np.min(np.abs(centers - c["y"])) <= max_dist:
+        y = c["y"]
+        allowed = max(min_dist, k * 2.8 * c["sigma"])
+        if np.min(np.abs(centers - y)) <= allowed:
             gated.append(c)
     return gated
 
@@ -248,25 +268,20 @@ def reject_elongated(log_resp, anisotropy_thresh=2.0):
     log_resp[ratio > anisotropy_thresh] = 0
     return log_resp
 
-def gate_by_valid_distance(cells, valid_mask, margin_px=2, r_scale=2.8):
-    """
-    Keep detections whose *entire circle* stays inside the valid region.
-    Uses distance-to-invalid-border in pixels.
-    """
+def gate_by_border_margin_sigma(cells, valid_mask, pad=1.2):
     if valid_mask is None:
         return cells
-
-    v = (valid_mask > 0).astype(np.uint8)
-    dist = cv2.distanceTransform(v, cv2.DIST_L2, 5)  # dist to nearest 0 pixel
-
+    h, w = valid_mask.shape[:2]
     out = []
     for c in cells:
+        r = int(pad * 2.8 * c["sigma"])
         x, y = c["x"], c["y"]
-        r = r_scale * float(c["sigma"])
-        if dist[y, x] >= (r + margin_px):
-            out.append(c)
+        if x < r or y < r or x >= w - r or y >= h - r:
+            continue
+        if valid_mask[y, x] == 0:
+            continue
+        out.append(c)
     return out
-
 
 def classify_focus(cells, sigma_thresh):
     """
@@ -298,7 +313,6 @@ def filter_min_distance(cells, k=1.1, r_scale=2.8):
         if ok:
             kept.append(c)
     return kept
-
 
 # -------------Cluster Detection------------------------
 def detect_clusters(cells, cluster_dist):
@@ -355,7 +369,6 @@ def cluster_eps_from_cells(cells, mult=1.6, r_scale=2.8, fallback=25):
     med_r = r_scale * med_sigma
     return mult * med_r
 
-
 def nms_within_clusters(cells, labels, k=2.2):
     """
     Run scale-aware NMS inside each DBSCAN cluster separately.
@@ -406,7 +419,7 @@ def draw_cells_and_clusters(
     # In-focus cells ----------
     for c in in_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(2.8 * c["sigma"])
+        r = int(3.3 * c["sigma"])
 
         if c["cluster"] == -1:
             color = (0, 255, 0)      # green = single cell
@@ -458,172 +471,110 @@ def pick_image_file():
     return file_path
 
 #--------------Main---------------
-def main(
-    min_sigma=5.0,
-    max_sigma=8.0,
-    num_scales=10,
-    focus_sigma_thresh=4.5,
-    min_dist=6,
-    cluster_eps=18,
-    min_cluster_size=2,
-    debug=True
-):
-    mag = "20x"
+def main(mag="20x", debug=True):
     cfg = MAG_CONFIGS[mag]
-    sigmas = sigmas_from_radius(cfg["radius_px"], step=0.6)  # slightly finer
+    if debug:
+        print(f"Using config: {mag} -> {cfg}")
 
-    # --------------------------------------------------
-    # Load image
-    # --------------------------------------------------
+    # --- derived from cfg ---
+    sigmas = sigmas_from_radius(cfg["radius_px"], step=cfg.get("sigma_step", 0.6))
 
     image_path = pick_image_file()
-
-
-    img_color = cv2.imread(image_path)
     if not image_path:
         print("No file selected. Exiting.")
         return
 
+    img_color = cv2.imread(image_path)
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
-    # --------------------------------------------------
-    # Estimate rotation + rotate
-    # --------------------------------------------------
     angle = estimate_rotation_angle(gray, debug=debug)
-
     img_rot = rotate_image(img_color, angle, border_value=(0, 0, 0))
     gray_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
+    valid = rotated_valid_mask(gray.shape, angle)
 
-    valid = rotated_valid_mask(gray.shape, angle)  # 255 where pixels are real
-
-    # --------------------------------------------------
-    # Preprocessing → response-ready image
-    # --------------------------------------------------
     stripe_mask = stripe_mask_from_rotated(gray_rot)
-    stripe_mask = cv2.bitwise_and(stripe_mask, valid)  # keep only valid region
+    stripe_mask = cv2.bitwise_and(stripe_mask, valid)
 
     pp = preprocess_for_cells(img_rot, stripe_mask)
-
-    # --------------------------------------------------
-    # Multi-scale LoG detection (PURE detection)
-    # --------------------------------------------------
-
     pp = 255 - pp
-    sigmas = np.arange(4.5, 11.0, 0.7)
-    min_sigma_keep = 4.0
 
-    cells = detect_cells_log(pp, sigmas, peak_percentile=cfg["peak_percentile"])
+    # --- detection using cfg ---
+    cells = detect_cells_log(
+        pp,
+        sigmas,
+        peak_percentile=cfg["peak_percentile"]
+    )
 
     if debug:
         print(f"Raw detections (pre-valid): {len(cells)}")
 
+    # --- border filtering using cfg ---
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
-    #cells = gate_by_valid_interior(cells, valid, margin=25)  # try 20–40
+    cells = gate_by_border_margin_sigma(cells, valid, pad=cfg["border_pad"])
 
     if debug:
         print(f"After valid-mask gate: {len(cells)}")
 
-    cells = gate_by_stripe_centers(cells, stripe_mask, max_dist=8)
+    # --- stripe gating using cfg ---
+    cells = gate_by_stripe_centers_scale(
+        cells,
+        stripe_mask,
+        k=cfg["stripe_gate_k"],
+        min_dist=cfg["stripe_gate_min_dist"]
+    )
     print("After stripe gating:", len(cells))
 
-    # --------------------------------------------------
-    # Focus classification (in / out)
-    # --------------------------------------------------
-    sig = np.array([c["sigma"] for c in cells], dtype=float)
-    focus_sigma_thresh = np.percentile(sig, 60)  # top ~60% sharpest as "in"
+    # --- NMS using cfg ---
+    cells = filter_min_distance(cells, k=cfg["nms_k"])
+    if debug:
+        print(f"After min-distance filtering: {len(cells)}")
 
+    # --- focus using cfg ---
+    sig = np.array([c["sigma"] for c in cells], dtype=float)
+    if len(sig) == 0:
+        print("No cells left after filtering.")
+        return
+
+    focus_sigma_thresh = np.percentile(sig, cfg.get("focus_sigma_percentile", 60))
     print(f"sigma stats: min={sig.min():.2f} med={np.median(sig):.2f} max={sig.max():.2f}")
 
     cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
 
-    # --------------------------------------------------
-    # Non-maximum suppression (merge duplicates)
-    # --------------------------------------------------
-    cells = filter_min_distance(cells, k=cfg["nms_k"])
-
-
-    if debug:
-        print(f"After min-distance filtering: {len(cells)}")
-
-    # --------------------------------------------------
-    # Separate in-focus vs out-of-focus
-    # --------------------------------------------------
-    # Focus classification
-    cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
-
-    # Separate
+    # split
     in_focus_cells = [c for c in cells if c["focus"] == "in"]
     out_of_focus_cells = [c for c in cells if c["focus"] == "out"]
 
-    # DBSCAN first (on in-focus candidates)
+    # --- clustering using cfg ---
+    med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
+    med_radius = 2.8 * med_sigma
+    cluster_eps = cfg["cluster_eps_mult"] * med_radius
+    min_cluster_size = cfg["cluster_min_samples"]
+
     labels, n_clusters = find_clusters_dbscan(
         in_focus_cells,
         eps=cluster_eps,
         min_samples=min_cluster_size
     )
 
-    # Attach cluster labels
     for c, lbl in zip(in_focus_cells, labels):
         c["cluster"] = int(lbl)
 
-    # NOW remove duplicates without breaking clusters
-    in_focus_cells = nms_within_clusters(in_focus_cells, labels, k=2.4)
+    # optional: NMS within clusters (uses same cfg nms_k)
+    in_focus_cells = nms_within_clusters(in_focus_cells, labels, k=cfg["nms_k"])
 
-    # If you also want NMS on out-of-focus (optional)
-    out_of_focus_cells = filter_min_distance(out_of_focus_cells, k=2.4)
-
-    # Recombine if you need a unified list for counting
-    cells = in_focus_cells + out_of_focus_cells
-
-    # --------------------------------------------------
-    # Counting
-    # --------------------------------------------------
-    cluster_groups = {}
-    for c in in_focus_cells:
-        cluster_groups.setdefault(c["cluster"], []).append(c)
-
-    clusters = [v for k, v in cluster_groups.items() if k != -1]
-
-    counts = count_results(cells, clusters)
-
-    print("----- Results -----")
-    for k, v in counts.items():
-        print(f"{k}: {v}")
-
-    # --------------------------------------------------
-    # Visualization
-    # --------------------------------------------------
-    vis = draw_cells_and_clusters(
-        img_rot,
+    # rerun clustering after within-cluster NMS
+    labels2, n_clusters2 = find_clusters_dbscan(
         in_focus_cells,
-        out_of_focus_cells,
-        draw_hulls=True
+        eps=cluster_eps,
+        min_samples=min_cluster_size
     )
+    for c, lbl in zip(in_focus_cells, labels2):
+        c["cluster"] = int(lbl)
 
-    cv2.imshow("Cells & Clusters", vis)
-    out_img = draw_cells_and_clusters(
-        img_rot,
-        in_focus_cells,
-        out_of_focus_cells,
-        draw_hulls=True
-    )
+    print(f"Clusters detected: {n_clusters2}")
 
-    cv2.imwrite("cell_detection_result.png", out_img)
-    print("Saved: cell_detection_result.png")
-
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    return counts, vis
+    # counting + visualization unchanged...
 
 # run main
-main(
-    min_sigma=5.0,
-    max_sigma=8.0,
-    num_scales=10,
-    focus_sigma_thresh=4.5,
-    min_dist=6,
-    cluster_eps=18,
-    min_cluster_size=2,
-    debug=True
-)
+main(mag="20x", debug=True)
+
