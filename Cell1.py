@@ -19,11 +19,11 @@ MAG_CONFIGS = {
     "20x": {
           "radius_px": (12, 28),
     "sigma_step": 0.6,
-    "peak_percentile": 99.0,
-    "stripe_gate_k": 0.9,
-    "stripe_gate_min_dist": 8,
-    "border_pad": 1.3,
-    "nms_k": 1.0,
+    "peak_percentile": 99.3,
+    "stripe_gate_k": 0.6,
+    "stripe_gate_min_dist": 12,
+    "border_margin": 35,
+    "nms_k": 2.2,
     "focus_sigma_percentile": 60,
     "cluster_eps_mult": 3.0,
     "cluster_min_samples": 3,
@@ -233,22 +233,24 @@ def stripe_centerlines(stripe_mask, row_thresh=10):
     centers.append((start + prev) // 2)
     return np.array(centers, dtype=int)
 
-def gate_by_stripe_centers_scale(cells, stripe_mask, k=1.0, min_dist=6):
+def gate_by_stripe_centers_scale(cells, stripe_mask, k=0.8, radius_mult=2.8, max_px=18):
     """
-    k controls how far from stripe center we allow, relative to detected radius.
-    allowed_dist = max(min_dist, k * 2.8 * sigma)
+    Keep detections close to stripe centerlines.
+    Distance threshold = min(max_px, k * (radius_mult * sigma))
     """
     centers = stripe_centerlines(stripe_mask)
     if len(centers) == 0:
         return cells
 
-    gated = []
+    kept = []
     for c in cells:
         y = c["y"]
-        allowed = max(min_dist, k * 2.8 * c["sigma"])
-        if np.min(np.abs(centers - y)) <= allowed:
-            gated.append(c)
-    return gated
+        r = radius_mult * c["sigma"]
+        thr = min(max_px, k * r)
+        if np.min(np.abs(centers - y)) <= thr:
+            kept.append(c)
+    return kept
+
 
 def reject_elongated(log_resp, anisotropy_thresh=2.0):
     """
@@ -268,20 +270,27 @@ def reject_elongated(log_resp, anisotropy_thresh=2.0):
     log_resp[ratio > anisotropy_thresh] = 0
     return log_resp
 
-def gate_by_border_margin_sigma(cells, valid_mask, pad=1.2):
-    if valid_mask is None:
+def gate_by_constant_border(cells, valid_mask, buffer_px=30):
+    """
+    Remove detections within buffer_px of the invalid/black rotation border.
+    Constant buffer in pixels (not sigma-based).
+    """
+    if valid_mask is None or len(cells) == 0:
         return cells
-    h, w = valid_mask.shape[:2]
-    out = []
+
+    v = (valid_mask > 0).astype(np.uint8) * 255
+
+    # shrink valid region inward by buffer_px
+    k = 2 * buffer_px + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    interior = cv2.erode(v, kernel, iterations=1)
+
+    kept = []
     for c in cells:
-        r = int(pad * 2.8 * c["sigma"])
-        x, y = c["x"], c["y"]
-        if x < r or y < r or x >= w - r or y >= h - r:
-            continue
-        if valid_mask[y, x] == 0:
-            continue
-        out.append(c)
-    return out
+        if interior[c["y"], c["x"]] > 0:
+            kept.append(c)
+    return kept
+
 
 def classify_focus(cells, sigma_thresh):
     """
@@ -510,18 +519,18 @@ def main(mag="20x", debug=True):
 
     # --- border filtering using cfg ---
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
-    cells = gate_by_border_margin_sigma(cells, valid, pad=cfg["border_pad"])
+    cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
 
     if debug:
         print(f"After valid-mask gate: {len(cells)}")
 
     # --- stripe gating using cfg ---
     cells = gate_by_stripe_centers_scale(
-        cells,
-        stripe_mask,
+        cells, stripe_mask,
         k=cfg["stripe_gate_k"],
-        min_dist=cfg["stripe_gate_min_dist"]
+        max_px=cfg["stripe_gate_min_dist"]  # reuse key, or rename in config if you want
     )
+
     print("After stripe gating:", len(cells))
 
     # --- NMS using cfg ---
