@@ -160,7 +160,7 @@ def preprocess_for_cells(img_color, stripe_mask):
 
     return gray
 #---------Heat Map--------------
-def detect_cells_log(pp, sigmas):
+def detect_cells_log(pp, sigmas, peak_percentile=99.6):
     responses = []
     best_sigma = np.zeros_like(pp, dtype=np.float32)
     best_resp = np.zeros_like(pp, dtype=np.float32)
@@ -168,23 +168,23 @@ def detect_cells_log(pp, sigmas):
     pp32 = pp.astype(np.float32)
 
     for sigma in sigmas:
-        log = cv2.GaussianBlur(pp32, (0, 0), sigma)
+        log = cv2.GaussianBlur(pp32, (0, 0), float(sigma))
         log = cv2.Laplacian(log, cv2.CV_32F)
-        log = np.abs(log) * (sigma ** 2)
+        log = np.abs(log) * (float(sigma) ** 2)
 
         log = reject_elongated(log)
 
         mask = log > best_resp
         best_resp[mask] = log[mask]
-        best_sigma[mask] = sigma
+        best_sigma[mask] = float(sigma)
 
     # local background subtraction
     bg = cv2.GaussianBlur(best_resp, (0, 0), sigmaX=10)
     log_norm = best_resp - bg
 
-    # peak detection on log_norm (NOT best_resp)
+    # peak detection on log_norm
     dilated = cv2.dilate(log_norm, np.ones((3, 3), np.uint8))
-    thr = np.percentile(log_norm, 99.7)
+    thr = np.percentile(log_norm, peak_percentile)
     peaks = (log_norm == dilated) & (log_norm > thr)
 
     ys, xs = np.where(peaks)
@@ -193,10 +193,11 @@ def detect_cells_log(pp, sigmas):
             "x": int(x),
             "y": int(y),
             "sigma": float(best_sigma[y, x]),
-            "response": float(log_norm[y, x])   # use normalized response
+            "response": float(log_norm[y, x]),
         })
 
     return responses
+
 
 
     #Focus scoring
@@ -247,23 +248,25 @@ def reject_elongated(log_resp, anisotropy_thresh=2.0):
     log_resp[ratio > anisotropy_thresh] = 0
     return log_resp
 
-def gate_by_valid_interior(cells, valid_mask, margin=20):
+def gate_by_valid_distance(cells, valid_mask, margin_px=2, r_scale=2.8):
     """
-    Remove detections near rotation border by eroding the valid mask.
-    margin = pixels of safety distance from invalid border.
+    Keep detections whose *entire circle* stays inside the valid region.
+    Uses distance-to-invalid-border in pixels.
     """
     if valid_mask is None:
         return cells
 
-    k = 2 * margin + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    interior = cv2.erode((valid_mask > 0).astype(np.uint8), kernel, iterations=1)
+    v = (valid_mask > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(v, cv2.DIST_L2, 5)  # dist to nearest 0 pixel
 
     out = []
     for c in cells:
-        if interior[c["y"], c["x"]] > 0:
+        x, y = c["x"], c["y"]
+        r = r_scale * float(c["sigma"])
+        if dist[y, x] >= (r + margin_px):
             out.append(c)
     return out
+
 
 def classify_focus(cells, sigma_thresh):
     """
@@ -273,24 +276,29 @@ def classify_focus(cells, sigma_thresh):
         c["focus"] = "in" if c["sigma"] <= sigma_thresh else "out"
     return cells
 
-def filter_min_distance(cells, k=2.2):
+def filter_min_distance(cells, k=1.1, r_scale=2.8):
+    """
+    Scale-aware NMS in PIXELS.
+    rad_px = k * max(radius_px_of_two_cells)
+           = k * r_scale * max(sigma)
+    """
     kept = []
-    # keep strongest responses first
     for c in sorted(cells, key=lambda x: -x["response"]):
-        x, y, s = c["x"], c["y"], c["sigma"]
+        x, y, s = c["x"], c["y"], float(c["sigma"])
         ok = True
         for kpt in kept:
             dx = x - kpt["x"]
             dy = y - kpt["y"]
             d2 = dx * dx + dy * dy
-            # suppression radius based on the larger sigma
-            rad = k * max(s, kpt["sigma"])
+
+            rad = k * r_scale * max(s, float(kpt["sigma"]))  # <-- KEY FIX
             if d2 < rad * rad:
                 ok = False
                 break
         if ok:
             kept.append(c)
     return kept
+
 
 # -------------Cluster Detection------------------------
 def detect_clusters(cells, cluster_dist):
@@ -339,6 +347,14 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
 
     return labels, n_clusters
+
+def cluster_eps_from_cells(cells, mult=1.6, r_scale=2.8, fallback=25):
+    if not cells:
+        return fallback
+    med_sigma = float(np.median([c["sigma"] for c in cells]))
+    med_r = r_scale * med_sigma
+    return mult * med_r
+
 
 def nms_within_clusters(cells, labels, k=2.2):
     """
@@ -454,7 +470,8 @@ def main(
 ):
     mag = "20x"
     cfg = MAG_CONFIGS[mag]
-    sigmas = sigmas_from_radius(cfg["radius_px"], step=0.8)
+    sigmas = sigmas_from_radius(cfg["radius_px"], step=0.6)  # slightly finer
+
     # --------------------------------------------------
     # Load image
     # --------------------------------------------------
@@ -495,12 +512,13 @@ def main(
     sigmas = np.arange(4.5, 11.0, 0.7)
     min_sigma_keep = 4.0
 
-    cells = detect_cells_log(pp, sigmas)
+    cells = detect_cells_log(pp, sigmas, peak_percentile=cfg["peak_percentile"])
+
     if debug:
         print(f"Raw detections (pre-valid): {len(cells)}")
 
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
-    cells = gate_by_valid_interior(cells, valid, margin=25)  # try 20–40
+    #cells = gate_by_valid_interior(cells, valid, margin=25)  # try 20–40
 
     if debug:
         print(f"After valid-mask gate: {len(cells)}")
@@ -521,7 +539,7 @@ def main(
     # --------------------------------------------------
     # Non-maximum suppression (merge duplicates)
     # --------------------------------------------------
-    cells = filter_min_distance(cells, k=2.4)
+    cells = filter_min_distance(cells, k=cfg["nms_k"])
 
 
     if debug:
