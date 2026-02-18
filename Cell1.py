@@ -17,7 +17,7 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (15, 30),
+          "radius_px": (10, 30),
     "sigma_step": 0.6,
     "peak_percentile": 95.7,
     "stripe_gate_k": 0.6,
@@ -25,8 +25,8 @@ MAG_CONFIGS = {
     "border_margin": 50,
     "nms_k": 2.5,
     "focus_sigma_percentile": 70,
-    "cluster_eps_mult": 3.0,
-    "cluster_min_samples": 3,
+    "cluster_eps_mult": 3.2,
+    "cluster_min_samples": 2,
     },
     "10x": {
         "radius_px": (6, 14),
@@ -358,7 +358,7 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     if len(cells) == 0:
         return np.array([]), 0
 
-    points = np.array([[c["x"], c["y"]] for c in cells])
+    points = np.array([[c["x"], 0.6* c["y"]] for c in cells])
 
     db = DBSCAN(
         eps=eps,
@@ -557,6 +557,7 @@ def main(mag="20x", debug=True):
     med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
     med_radius = 2.8 * med_sigma
     cluster_eps = cfg["cluster_eps_mult"] * med_radius
+    cluster_eps = min(cluster_eps, 1.6 * cfg["radius_px"][1])
     min_cluster_size = cfg["cluster_min_samples"]
 
     labels, n_clusters = find_clusters_dbscan(
