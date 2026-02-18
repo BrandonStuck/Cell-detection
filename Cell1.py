@@ -17,14 +17,14 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (12, 28),
+          "radius_px": (15, 30),
     "sigma_step": 0.6,
-    "peak_percentile": 99.3,
+    "peak_percentile": 95.7,
     "stripe_gate_k": 0.6,
     "stripe_gate_min_dist": 12,
-    "border_margin": 35,
-    "nms_k": 2.2,
-    "focus_sigma_percentile": 60,
+    "border_margin": 50,
+    "nms_k": 2.5,
+    "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.0,
     "cluster_min_samples": 3,
     },
@@ -270,7 +270,7 @@ def reject_elongated(log_resp, anisotropy_thresh=2.0):
     log_resp[ratio > anisotropy_thresh] = 0
     return log_resp
 
-def gate_by_constant_border(cells, valid_mask, buffer_px=30):
+def gate_by_constant_border(cells, valid_mask, buffer_px=70):
     """
     Remove detections within buffer_px of the invalid/black rotation border.
     Constant buffer in pixels (not sigma-based).
@@ -582,7 +582,48 @@ def main(mag="20x", debug=True):
 
     print(f"Clusters detected: {n_clusters2}")
 
-    # counting + visualization unchanged...
+    # --------------------------------------------------
+    # Counting
+    # --------------------------------------------------
+    cluster_groups = {}
+    for c in in_focus_cells:
+        cluster_groups.setdefault(c["cluster"], []).append(c)
+
+    clusters = [v for k, v in cluster_groups.items() if k != -1]
+
+    counts = count_results(cells, clusters)
+
+    print("----- Results -----")
+    for k, v in counts.items():
+        print(f"{k}: {v}")
+
+    # --------------------------------------------------
+    # Visualization
+    # --------------------------------------------------
+    vis = draw_cells_and_clusters(
+        img_rot,
+        in_focus_cells,
+        out_of_focus_cells,
+        draw_hulls=True
+    )
+
+    cv2.imshow("Cells & Clusters", vis)
+
+    out_img = draw_cells_and_clusters(
+        img_rot,
+        in_focus_cells,
+        out_of_focus_cells,
+        draw_hulls=True
+    )
+
+    cv2.imwrite("cell_detection_result.png", out_img)
+    print("Saved: cell_detection_result.png")
+
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    return counts, vis
+
 
 # run main
 main(mag="20x", debug=True)
