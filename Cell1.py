@@ -358,7 +358,7 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     if len(cells) == 0:
         return np.array([]), 0
 
-    points = np.array([[c["x"], 0.6* c["y"]] for c in cells])
+    points = np.array([[c["x"], c["y"]] for c in cells], dtype=np.float32)
 
     db = DBSCAN(
         eps=eps,
@@ -557,7 +557,7 @@ def main(mag="20x", debug=True):
     med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
     med_radius = 2.8 * med_sigma
     cluster_eps = cfg["cluster_eps_mult"] * med_radius
-    cluster_eps = min(cluster_eps, 1.6 * cfg["radius_px"][1])
+    #cluster_eps = min(cluster_eps, 1.6 * cfg["radius_px"][1])
     min_cluster_size = cfg["cluster_min_samples"]
 
     labels, n_clusters = find_clusters_dbscan(
