@@ -17,13 +17,13 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (10, 30),
+          "radius_px": (10, 34),
     "sigma_step": 0.6,
-    "peak_percentile": 95.7,
-    "stripe_gate_k": 0.8,
-    "stripe_gate_min_dist": 15,
-    "border_margin": 50,
-    "nms_k": 2.5,
+    "peak_percentile": 96.9,
+    "stripe_gate_k": 1.0,
+    "stripe_gate_min_dist": 22,
+    "border_margin": 60,
+    "nms_k": 2.1,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
@@ -182,6 +182,7 @@ def detect_cells_log(pp, sigmas, peak_percentile=99.0):
     for i in range(stack.shape[0]):
         bg = cv2.GaussianBlur(stack[i], (0, 0), sigmaX=10)
         stack[i] = stack[i] - bg
+        stack[i] = np.maximum(stack[i], 0)
 
     # scale-space max: must be max in (x,y) AND locally max across sigma
     best_idx = np.argmax(stack, axis=0)              # [H,W]
@@ -191,12 +192,14 @@ def detect_cells_log(pp, sigmas, peak_percentile=99.0):
     scale_ok = np.zeros_like(best_val, dtype=bool)
     for si in range(1, stack.shape[0]-1):
         m = (best_idx == si)
-        scale_ok[m] = (stack[si][m] > stack[si-1][m]) & (stack[si][m] > stack[si+1][m])
+        eps = 1e-6
+        scale_ok[m] = (stack[si][m] >= stack[si - 1][m] - eps) & (stack[si][m] >= stack[si + 1][m] - eps)
 
     # 2D peak detection on best_val
     dil = cv2.dilate(best_val, np.ones((3, 3), np.uint8))
     thr = np.percentile(best_val, peak_percentile)
-    peaks = (best_val == dil) & (best_val > thr) & scale_ok
+    eps2 = 1e-3 * float(best_val.max() + 1e-6)
+    peaks = (best_val >= dil - eps2) & (best_val > thr) & scale_ok
 
     ys, xs = np.where(peaks)
     out = []
@@ -252,7 +255,7 @@ def gate_by_stripe_centers_scale(cells, stripe_mask, k=0.8, radius_mult=2.8, max
     return kept
 
 
-def reject_elongated(log_resp, anisotropy_thresh=2.0):
+def reject_elongated(log_resp, anisotropy_thresh=1.6):
     """
     Suppress elongated (stripe-like) responses.
     Keeps isotropic (cell-like) blobs.
@@ -283,7 +286,7 @@ def gate_by_constant_border(cells, valid_mask, buffer_px=70):
     # shrink valid region inward by buffer_px
     k = 2 * buffer_px + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    interior = cv2.erode(v, kernel, iterations=1)
+    interior = cv2.erode(v, kernel, iterations=2)
 
     kept = []
     for c in cells:
@@ -315,7 +318,7 @@ def filter_min_distance(cells, k=1.1, r_scale=2.8):
             dy = y - kpt["y"]
             d2 = dx * dx + dy * dy
 
-            rad = k * r_scale * max(s, float(kpt["sigma"]))  # <-- KEY FIX
+            rad = k * r_scale * math.sqrt(s * float(kpt["sigma"]))
             if d2 < rad * rad:
                 ok = False
                 break
@@ -503,6 +506,7 @@ def main(mag="20x", debug=True):
 
     stripe_mask = stripe_mask_from_rotated(gray_rot)
     stripe_mask = cv2.bitwise_and(stripe_mask, valid)
+    stripe_mask = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
 
     pp = preprocess_for_cells(img_rot, stripe_mask)
     pp = 255 - pp
@@ -530,7 +534,7 @@ def main(mag="20x", debug=True):
         k=cfg["stripe_gate_k"],
         max_px=cfg["stripe_gate_min_dist"]  # reuse key, or rename in config if you want
     )
-
+    cells = [c for c in cells if stripe_mask[c["y"], c["x"]] > 30]
     print("After stripe gating:", len(cells))
 
     # --- NMS using cfg ---
