@@ -507,6 +507,14 @@ def main(mag="20x", debug=True):
     stripe_mask = stripe_mask_from_rotated(gray_rot)
     stripe_mask = cv2.bitwise_and(stripe_mask, valid)
     stripe_mask = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
+    # stripe_mask already ANDed with valid and blurred
+    stripe_bin = (stripe_mask > 50).astype(np.uint8) * 255
+
+    # shrink stripe region away from borders / stripe ends
+    edge_pad = 50  # try 40–70; this is a NEW knob
+    k = 2 * edge_pad + 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    stripe_safe = cv2.erode(stripe_bin, ker, iterations=1)
 
     pp = preprocess_for_cells(img_rot, stripe_mask)
     pp = 255 - pp
@@ -534,7 +542,7 @@ def main(mag="20x", debug=True):
         k=cfg["stripe_gate_k"],
         max_px=cfg["stripe_gate_min_dist"]  # reuse key, or rename in config if you want
     )
-    cells = [c for c in cells if stripe_mask[c["y"], c["x"]] > 30]
+    cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
     print("After stripe gating:", len(cells))
 
     # --- NMS using cfg ---
@@ -605,6 +613,9 @@ def main(mag="20x", debug=True):
     # --------------------------------------------------
     # Visualization
     # --------------------------------------------------
+    # --------------------------------------------------
+    # Visualization + Save (formatted like the example)
+    # --------------------------------------------------
     vis = draw_cells_and_clusters(
         img_rot,
         in_focus_cells,
@@ -612,19 +623,61 @@ def main(mag="20x", debug=True):
         draw_hulls=True
     )
 
-    cv2.imshow("Cells & Clusters", vis)
+    # --- Build a report-style canvas (white margins + title + footer) ---
+    h, w = vis.shape[:2]
 
-    out_img = draw_cells_and_clusters(
-        img_rot,
-        in_focus_cells,
-        out_of_focus_cells,
-        draw_hulls=True
+    top_pad = 90
+    bottom_pad = 110
+    side_pad = 60
+
+    canvas_h = h + top_pad + bottom_pad
+    canvas_w = w + 2 * side_pad
+
+    canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)  # white background
+    canvas[top_pad:top_pad + h, side_pad:side_pad + w] = vis
+
+    # Title (centered)
+    title = mag  # e.g. "20x"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    title_scale = 1.4
+    title_thick = 3
+    (tw, th), _ = cv2.getTextSize(title, font, title_scale, title_thick)
+    tx = (canvas_w - tw) // 2
+    ty = (top_pad // 2) + (th // 2) + 10
+    cv2.putText(canvas, title, (tx, ty), font, title_scale, (0, 0, 0), title_thick, cv2.LINE_AA)
+
+    # Footer text
+    counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
+    footer = (
+        f"Data: in_focus={counts['in_focus_cells']}  out_focus={counts['out_of_focus_cells']}  "
+        f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
     )
+    footer_scale = 0.9
+    footer_thick = 2
+    fx = 40
+    fy = top_pad + h + 70
+    cv2.putText(canvas, footer, (fx, fy), font, footer_scale, (0, 0, 0), footer_thick, cv2.LINE_AA)
 
-    cv2.imwrite("cell_detection_result.png", out_img)
-    print("Saved: cell_detection_result.png")
+    # --- Save to disk ---
+    out_path = "cell_detection_report.png"
+    cv2.imwrite(out_path, canvas)
+    print(f"Saved: {out_path}")
 
-    cv2.waitKey(0)
+    # --- Show in a window and BLOCK until user closes it ---
+    win = "Cell Detection Report"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1080,720)
+    cv2.imshow(win, canvas)
+
+    # This blocks until user closes window (or presses a key if they use the window controls)
+    # We'll enforce close-to-continue by polling window visibility:
+    while True:
+        # returns < 0 when the window is closed
+        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+            break
+        cv2.waitKey(50)
+
+    cv2.destroyWindow(win)
     cv2.destroyAllWindows()
 
     return counts, vis
