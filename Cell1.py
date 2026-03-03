@@ -361,14 +361,8 @@ def find_clusters_dbscan(cells, eps, min_samples=2):
     if len(cells) == 0:
         return np.array([]), 0
 
-    points = np.array([[c["x"], c["y"]] for c in cells], dtype=np.float32)
-
-    db = DBSCAN(
-        eps=eps,
-        min_samples=min_samples,
-        metric="euclidean"
-    ).fit(points)
-
+    points = np.array([[c["x"]] for c in cells], dtype=np.float32)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(points)
     labels = db.labels_
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
 
@@ -530,8 +524,18 @@ def main(mag="20x", debug=True):
         print(f"Raw detections (pre-valid): {len(cells)}")
 
     # --- border filtering using cfg ---
+    # shrink stripes away from borders, but don't annihilate them
+    edge_pad = 15  # START HERE (try 10–25)
+    k = 2 * edge_pad + 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    stripe_safe = cv2.erode(stripe_mask, ker, iterations=1)
+
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
+    cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
+
+    print("stripe_bin coverage:", np.mean(stripe_mask> 0))
+    print("stripe_safe coverage:", np.mean(stripe_safe > 0))
 
     if debug:
         print(f"After valid-mask gate: {len(cells)}")
@@ -565,6 +569,15 @@ def main(mag="20x", debug=True):
     in_focus_cells = [c for c in cells if c["focus"] == "in"]
     out_of_focus_cells = [c for c in cells if c["focus"] == "out"]
 
+    centers = stripe_centerlines(stripe_bin)  # use binary, not blurred
+    if len(centers) > 0:
+        # assign each cell to nearest stripe centerline
+        for c in in_focus_cells:
+            c["row"] = int(np.argmin(np.abs(centers - c["y"])))
+    else:
+        for c in in_focus_cells:
+            c["row"] = -1
+
     # --- clustering using cfg ---
     med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
     med_radius = 2.8 * med_sigma
@@ -572,28 +585,32 @@ def main(mag="20x", debug=True):
     #cluster_eps = min(cluster_eps, 1.6 * cfg["radius_px"][1])
     min_cluster_size = cfg["cluster_min_samples"]
 
-    labels, n_clusters = find_clusters_dbscan(
-        in_focus_cells,
-        eps=cluster_eps,
-        min_samples=min_cluster_size
-    )
+    next_cluster_id = 0
+    for c in in_focus_cells:
+        c["cluster"] = -1
 
-    for c, lbl in zip(in_focus_cells, labels):
-        c["cluster"] = int(lbl)
+    for row_id in sorted(set(c["row"] for c in in_focus_cells)):
+        row_cells = [c for c in in_focus_cells if c["row"] == row_id]
+        if len(row_cells) < cfg["cluster_min_samples"]:
+            continue
 
-    # optional: NMS within clusters (uses same cfg nms_k)
-    in_focus_cells = nms_within_clusters(in_focus_cells, labels, k=cfg["nms_k"])
+        # IMPORTANT: within-row eps can be bigger now
+        eps_row = cluster_eps * 1.6  # NEW knob: 1.0–1.8 typically
 
-    # rerun clustering after within-cluster NMS
-    labels2, n_clusters2 = find_clusters_dbscan(
-        in_focus_cells,
-        eps=cluster_eps,
-        min_samples=min_cluster_size
-    )
-    for c, lbl in zip(in_focus_cells, labels2):
-        c["cluster"] = int(lbl)
+        labels, _ = find_clusters_dbscan(row_cells, eps=eps_row, min_samples=cfg["cluster_min_samples"])
 
-    print(f"Clusters detected: {n_clusters2}")
+        # remap row-local labels to global unique cluster IDs
+        for c, lbl in zip(row_cells, labels):
+            if int(lbl) == -1:
+                c["cluster"] = -1
+            else:
+                c["cluster"] = next_cluster_id + int(lbl)
+
+        # advance cluster id counter
+        n_row_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        next_cluster_id += n_row_clusters
+
+    print(f"Clusters detected: {n_row_clusters}")
 
     # --------------------------------------------------
     # Counting
