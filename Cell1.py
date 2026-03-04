@@ -31,13 +31,13 @@ MAG_CONFIGS = {
     "scale": 1.0
     },
     "40x": {
-        "radius_px": (11, 34),
-        "sigma_step": 0.6,
-        "peak_percentile": 96.3,
+        "radius_px": (6, 16),
+        "sigma_step": 0.4,
+        "peak_percentile": 90.0,
         "stripe_gate_k": 1.0,
         "stripe_gate_min_dist": 22,
         "border_margin": 60,
-        "nms_k": 2.0,
+        "nms_k": 1.1,
         "focus_sigma_percentile": 70,
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
@@ -517,6 +517,17 @@ def main(mag="20x", debug=True):
     # stripe_mask already ANDed with valid and blurred
     stripe_bin = (stripe_mask > 50).astype(np.uint8) * 255
 
+    # stripe_bin is 0/255
+    stripe_u8 = stripe_bin.astype(np.uint8)
+
+    # Make a thin "edge band" around stripe boundaries
+    k = 7  # try 5, 7, or 9
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+    er = cv2.erode(stripe_u8, ker, iterations=1)
+    di = cv2.dilate(stripe_u8, ker, iterations=1)
+
+    edge_band = cv2.subtract(di, er)  # 255 only near boundaries
 
     # shrink stripe region away from borders / stripe ends
     edge_pad = 50  # try 40–70; this is a NEW knob
@@ -528,19 +539,39 @@ def main(mag="20x", debug=True):
     if cfg.get("polarity", "inverted") == "inverted":
         pp = 255 - pp
 
+    # Remove long horizontal structures (channels)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 3))
+    background = cv2.morphologyEx(pp, cv2.MORPH_OPEN, kernel)
+
+    pp = cv2.subtract(pp, background)
     # --- detection using cfg ---
     cells = detect_cells_log(
         pp,
         sigmas,
         peak_percentile=cfg["peak_percentile"]
     )
+    # compute gradients
+    gx = cv2.Sobel(gray_rot, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_rot, cv2.CV_32F, 0, 1, ksize=3)
 
+    filtered = []
+    for c in cells:
+        x = c["x"]
+        y = c["y"]
+
+        # if horizontal gradient dominates, it's likely a stripe
+        if abs(gy[y, x]) > abs(gx[y, x]) * 1.5:
+            continue
+
+        filtered.append(c)
+
+    cells = filtered
     if debug:
         print(f"Raw detections (pre-valid): {len(cells)}")
 
     # --- border filtering using cfg ---
     # shrink stripes away from borders, but don't annihilate them
-    edge_pad = 15  # START HERE (try 10–25)
+    edge_pad = 15
     k = 2 * edge_pad + 1
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     stripe_safe = cv2.erode(stripe_mask, ker, iterations=1)
@@ -548,6 +579,7 @@ def main(mag="20x", debug=True):
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
     cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
+    cells = [c for c in cells if edge_band[c["y"], c["x"]] == 0]
 
 
 
@@ -683,7 +715,7 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']}  out/in = {counts['out_of_focus_cells']/counts['in_focus_cells']}  "
+        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']}  out/in = {round(counts['out_of_focus_cells']/counts['in_focus_cells'],2)}  "
         f"clusters={counts['clusters']}  cells in clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
