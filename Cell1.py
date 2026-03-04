@@ -27,22 +27,22 @@ MAG_CONFIGS = {
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
+    "polarity": "normal",
+    "scale": 1.0
     },
-    "10x": {
-        "radius_px": (6, 14),
-        "peak_percentile": 99.6,
-        "stripe_gate_dist": 15,
-        "border_margin": 10,
-        "nms_k": 2.6,
-        "cluster_eps_mult": 3.0,
-    },
-    "4x": {
-        "radius_px": (3, 9),
-        "peak_percentile": 99.7,
-        "stripe_gate_dist": 15,
-        "border_margin": 10,
-        "nms_k": 2.6,
-        "cluster_eps_mult": 3.0,
+    "40x": {
+        "radius_px": (11, 34),
+        "sigma_step": 0.6,
+        "peak_percentile": 96.3,
+        "stripe_gate_k": 1.0,
+        "stripe_gate_min_dist": 22,
+        "border_margin": 60,
+        "nms_k": 2.0,
+        "focus_sigma_percentile": 70,
+        "cluster_eps_mult": 3.5,
+        "cluster_min_samples": 2,
+        "polarity": "inverted",
+        "scale": 0.5
     },
 }
 def sigmas_from_radius(radius_range, step=0.8):
@@ -482,6 +482,7 @@ def main(mag="20x", debug=True):
     if debug:
         print(f"Using config: {mag} -> {cfg}")
 
+
     # --- derived from cfg ---
     sigmas = sigmas_from_radius(cfg["radius_px"], step=cfg.get("sigma_step", 0.6))
 
@@ -491,18 +492,31 @@ def main(mag="20x", debug=True):
         return
 
     img_color = cv2.imread(image_path)
+
+    # scale image based on magnification
+    scale = MAG_CONFIGS[mag]["scale"]
+    if scale != 1.0:
+        img_color = cv2.resize(
+            img_color, None,
+            fx=scale, fy=scale,
+            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        )
+
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
     angle = estimate_rotation_angle(gray, debug=debug)
     img_rot = rotate_image(img_color, angle, border_value=(0, 0, 0))
     gray_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
-    valid = rotated_valid_mask(gray.shape, angle)
+
+    # IMPORTANT: valid mask must match the rotated/scaled size
+    valid = rotated_valid_mask(gray_rot.shape, angle)
 
     stripe_mask = stripe_mask_from_rotated(gray_rot)
     stripe_mask = cv2.bitwise_and(stripe_mask, valid)
     stripe_mask = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
     # stripe_mask already ANDed with valid and blurred
     stripe_bin = (stripe_mask > 50).astype(np.uint8) * 255
+
 
     # shrink stripe region away from borders / stripe ends
     edge_pad = 50  # try 40–70; this is a NEW knob
@@ -511,7 +525,8 @@ def main(mag="20x", debug=True):
     stripe_safe = cv2.erode(stripe_bin, ker, iterations=1)
 
     pp = preprocess_for_cells(img_rot, stripe_mask)
-    pp = 255 - pp
+    if cfg.get("polarity", "inverted") == "inverted":
+        pp = 255 - pp
 
     # --- detection using cfg ---
     cells = detect_cells_log(
@@ -533,6 +548,8 @@ def main(mag="20x", debug=True):
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
     cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
+
+
 
     print("stripe_bin coverage:", np.mean(stripe_mask> 0))
     print("stripe_safe coverage:", np.mean(stripe_safe > 0))
@@ -666,8 +683,8 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in_focus={counts['in_focus_cells']}  out_focus={counts['out_of_focus_cells']}  "
-        f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
+        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']}  out/in = {counts['out_of_focus_cells']/counts['in_focus_cells']}  "
+        f"clusters={counts['clusters']}  cells in clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
     footer_thick = 2
@@ -675,6 +692,9 @@ def main(mag="20x", debug=True):
     fy = top_pad + h + 70
     cv2.putText(canvas, footer, (fx, fy), font, footer_scale, (0, 0, 0), footer_thick, cv2.LINE_AA)
 
+    #turn on waveform depending on ratio, ratio can be adjusted
+   # if counts['in_focus_cells'] > 50 and counts['out_of_focus_cells']/counts['in_focus_cells'] > 0.5:
+        #call waveform function
     # --- Save to disk ---
     out_path = "cell_detection_report.png"
     cv2.imwrite(out_path, canvas)
@@ -701,5 +721,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x", debug=True)
+main(mag="40x", debug=True)
 
