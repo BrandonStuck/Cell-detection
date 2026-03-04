@@ -17,13 +17,13 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (10, 34),
+          "radius_px": (11, 34),
     "sigma_step": 0.6,
-    "peak_percentile": 96.9,
+    "peak_percentile": 96.3,
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 2.1,
+    "nms_k": 2.0,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
@@ -198,7 +198,7 @@ def detect_cells_log(pp, sigmas, peak_percentile=99.0):
     # 2D peak detection on best_val
     dil = cv2.dilate(best_val, np.ones((3, 3), np.uint8))
     thr = np.percentile(best_val, peak_percentile)
-    eps2 = 1e-3 * float(best_val.max() + 1e-6)
+    eps2 = 3e-4 * float(best_val.max() + 1e-6)
     peaks = (best_val >= dil - eps2) & (best_val > thr) & scale_ok
 
     ys, xs = np.where(peaks)
@@ -255,7 +255,7 @@ def gate_by_stripe_centers_scale(cells, stripe_mask, k=0.8, radius_mult=2.8, max
     return kept
 
 
-def reject_elongated(log_resp, anisotropy_thresh=1.6):
+def reject_elongated(log_resp, anisotropy_thresh=1.5):
     """
     Suppress elongated (stripe-like) responses.
     Keeps isotropic (cell-like) blobs.
