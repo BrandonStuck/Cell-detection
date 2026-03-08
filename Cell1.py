@@ -17,32 +17,32 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (11, 34),
+          "radius_px": (12, 34),
     "sigma_step": 0.6,
-    "peak_percentile": 96.3,
+    "peak_percentile": 96.0,
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 2.0,
+    "nms_k": 1.9,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
-    "polarity": "normal",
-    "scale": 1.0
     },
-    "40x": {
-        "radius_px": (6, 16),
-        "sigma_step": 0.4,
-        "peak_percentile": 90.0,
-        "stripe_gate_k": 1.0,
-        "stripe_gate_min_dist": 22,
-        "border_margin": 60,
-        "nms_k": 1.1,
-        "focus_sigma_percentile": 70,
-        "cluster_eps_mult": 3.5,
-        "cluster_min_samples": 2,
-        "polarity": "inverted",
-        "scale": 0.5
+    "10x": {
+        "radius_px": (6, 14),
+        "peak_percentile": 99.6,
+        "stripe_gate_dist": 15,
+        "border_margin": 10,
+        "nms_k": 2.6,
+        "cluster_eps_mult": 3.0,
+    },
+    "4x": {
+        "radius_px": (3, 9),
+        "peak_percentile": 99.7,
+        "stripe_gate_dist": 15,
+        "border_margin": 10,
+        "nms_k": 2.6,
+        "cluster_eps_mult": 3.0,
     },
 }
 def sigmas_from_radius(radius_range, step=0.8):
@@ -425,7 +425,7 @@ def draw_cells_and_clusters(
     # In-focus cells ----------
     for c in in_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(3.3 * c["sigma"])
+        r = int(2.8 * c["sigma"])
 
         if c["cluster"] == -1:
             color = (0, 255, 0)      # green = single cell
@@ -438,7 +438,7 @@ def draw_cells_and_clusters(
     #  Out-of-focus cells ----------
     for c in out_of_focus_cells:
         x, y = int(c["x"]), int(c["y"])
-        r = int(3.4 * c["sigma"])
+        r = int(2.8 * c["sigma"])
 
         cv2.circle(out, (x, y), r, (255, 0, 0), 2)   # blue
         cv2.circle(out, (x, y), 2, (255, 0, 0), -1)
@@ -482,7 +482,6 @@ def main(mag="20x", debug=True):
     if debug:
         print(f"Using config: {mag} -> {cfg}")
 
-
     # --- derived from cfg ---
     sigmas = sigmas_from_radius(cfg["radius_px"], step=cfg.get("sigma_step", 0.6))
 
@@ -492,110 +491,45 @@ def main(mag="20x", debug=True):
         return
 
     img_color = cv2.imread(image_path)
-
-    # scale image based on magnification
-    scale = MAG_CONFIGS[mag]["scale"]
-    if scale != 1.0:
-        img_color = cv2.resize(
-            img_color, None,
-            fx=scale, fy=scale,
-            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        )
-
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
     angle = estimate_rotation_angle(gray, debug=debug)
     img_rot = rotate_image(img_color, angle, border_value=(0, 0, 0))
     gray_rot = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
-
-    # IMPORTANT: valid mask must match the rotated/scaled size
-    valid = rotated_valid_mask(gray_rot.shape, angle)
+    valid = rotated_valid_mask(gray.shape, angle)
 
     stripe_mask = stripe_mask_from_rotated(gray_rot)
     stripe_mask = cv2.bitwise_and(stripe_mask, valid)
-    stripe_mask = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
-    # stripe_mask already ANDed with valid and blurred
-    stripe_bin = (stripe_mask > 50).astype(np.uint8) * 255
 
-    # stripe_bin is 0/255
-    stripe_u8 = stripe_bin.astype(np.uint8)
+    stripe_blur = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
+    stripe_bin = (stripe_blur > 50).astype(np.uint8) * 255
 
-    # Make a thin "edge band" around stripe boundaries
-    k = 7  # try 5, 7, or 9
-    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-
-    er = cv2.erode(stripe_u8, ker, iterations=1)
-    di = cv2.dilate(stripe_u8, ker, iterations=1)
-
-    edge_band = cv2.subtract(di, er)  # 255 only near boundaries
-
-    # shrink stripe region away from borders / stripe ends
-    edge_pad = 50  # try 40–70; this is a NEW knob
+    edge_pad = 15
     k = 2 * edge_pad + 1
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     stripe_safe = cv2.erode(stripe_bin, ker, iterations=1)
 
-    pp = preprocess_for_cells(img_rot, stripe_mask)
-    if cfg.get("polarity", "inverted") == "inverted":
-        pp = 255 - pp
+    pp = preprocess_for_cells(img_rot, stripe_blur)
+    pp = 255 - pp
 
-    # Remove long horizontal structures (channels)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 3))
-    background = cv2.morphologyEx(pp, cv2.MORPH_OPEN, kernel)
+    cells = detect_cells_log(pp, sigmas, peak_percentile=cfg["peak_percentile"])
 
-    pp = cv2.subtract(pp, background)
-    # --- detection using cfg ---
-    cells = detect_cells_log(
-        pp,
-        sigmas,
-        peak_percentile=cfg["peak_percentile"]
-    )
-    # compute gradients
-    gx = cv2.Sobel(gray_rot, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray_rot, cv2.CV_32F, 0, 1, ksize=3)
-
-    filtered = []
-    for c in cells:
-        x = c["x"]
-        y = c["y"]
-
-        # if horizontal gradient dominates, it's likely a stripe
-        if abs(gy[y, x]) > abs(gx[y, x]) * 1.5:
-            continue
-
-        filtered.append(c)
-
-    cells = filtered
-    if debug:
-        print(f"Raw detections (pre-valid): {len(cells)}")
-
-    # --- border filtering using cfg ---
-    # shrink stripes away from borders, but don't annihilate them
-    edge_pad = 15
-    k = 2 * edge_pad + 1
-    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    stripe_safe = cv2.erode(stripe_mask, ker, iterations=1)
+    print(f"Raw detections (pre-valid): {len(cells)}")
 
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
     cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
-    cells = [c for c in cells if edge_band[c["y"], c["x"]] == 0]
 
-
-
-    print("stripe_bin coverage:", np.mean(stripe_mask> 0))
+    print("stripe_bin coverage:", np.mean(stripe_bin > 0))
     print("stripe_safe coverage:", np.mean(stripe_safe > 0))
+    print(f"After valid-mask gate: {len(cells)}")
 
-    if debug:
-        print(f"After valid-mask gate: {len(cells)}")
-
-    # --- stripe gating using cfg ---
     cells = gate_by_stripe_centers_scale(
-        cells, stripe_mask,
+        cells, stripe_bin,
         k=cfg["stripe_gate_k"],
-        max_px=cfg["stripe_gate_min_dist"]  # reuse key, or rename in config if you want
+        max_px=cfg["stripe_gate_min_dist"]
     )
-    cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
+
     print("After stripe gating:", len(cells))
 
     # --- NMS using cfg ---
@@ -659,7 +593,8 @@ def main(mag="20x", debug=True):
         n_row_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         next_cluster_id += n_row_clusters
 
-    print(f"Clusters detected: {n_row_clusters}")
+    total_clusters = len(set(c["cluster"] for c in in_focus_cells) - {-1})
+    print(f"Clusters detected: {total_clusters}")
 
     # --------------------------------------------------
     # Counting
@@ -715,8 +650,8 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']}  out/in = {round(counts['out_of_focus_cells']/counts['in_focus_cells'],2)}  "
-        f"clusters={counts['clusters']}  cells in clusters={counts['cells_in_clusters']}"
+        f"Data: in_focus={counts['in_focus_cells']}  out_focus={counts['out_of_focus_cells']}  "
+        f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
     footer_thick = 2
@@ -724,9 +659,6 @@ def main(mag="20x", debug=True):
     fy = top_pad + h + 70
     cv2.putText(canvas, footer, (fx, fy), font, footer_scale, (0, 0, 0), footer_thick, cv2.LINE_AA)
 
-    #turn on waveform depending on ratio, ratio can be adjusted
-   # if counts['in_focus_cells'] > 50 and counts['out_of_focus_cells']/counts['in_focus_cells'] > 0.5:
-        #call waveform function
     # --- Save to disk ---
     out_path = "cell_detection_report.png"
     cv2.imwrite(out_path, canvas)
@@ -753,5 +685,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="40x", debug=True)
+main(mag="20x", debug=True)
 
