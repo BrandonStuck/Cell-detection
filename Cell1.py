@@ -17,33 +17,18 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (12, 34),
+          "radius_px": (10, 34),
     "sigma_step": 0.6,
     "peak_percentile": 96.0,
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 1.9,
+    "nms_k": 1.8,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
     },
-    "10x": {
-        "radius_px": (6, 14),
-        "peak_percentile": 99.6,
-        "stripe_gate_dist": 15,
-        "border_margin": 10,
-        "nms_k": 2.6,
-        "cluster_eps_mult": 3.0,
-    },
-    "4x": {
-        "radius_px": (3, 9),
-        "peak_percentile": 99.7,
-        "stripe_gate_dist": 15,
-        "border_margin": 10,
-        "nms_k": 2.6,
-        "cluster_eps_mult": 3.0,
-    },
+
 }
 def sigmas_from_radius(radius_range, step=0.8):
     rmin, rmax = radius_range
@@ -502,9 +487,9 @@ def main(mag="20x", debug=True):
     stripe_mask = cv2.bitwise_and(stripe_mask, valid)
 
     stripe_blur = cv2.GaussianBlur(stripe_mask, (0, 0), 5)
-    stripe_bin = (stripe_blur > 50).astype(np.uint8) * 255
+    stripe_bin = (stripe_blur > 35).astype(np.uint8) * 255
 
-    edge_pad = 15
+    edge_pad = 9
     k = 2 * edge_pad + 1
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     stripe_safe = cv2.erode(stripe_bin, ker, iterations=1)
