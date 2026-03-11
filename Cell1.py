@@ -68,7 +68,7 @@ def compute_candidate_features(gray, x, y, sigma):
     Compute local patch features around one candidate.
     Uses grayscale image after preprocessing/inversion (pp), not color image.
     """
-    r = max(6, int(round(2.8 * sigma)))
+    r = max(7, int(round(2.8 * sigma)))
     patch, x0, y0 = extract_patch(gray, x, y, r)
     if patch is None:
         return None
@@ -135,9 +135,9 @@ def score_candidate(feat):
 
     score = 0.0
     score += 0.08 * feat["ring_contrast"]
-    score += 2.2 * feat["circular_occupancy"]
-    score += 1.2 * feat["isotropy"]
-    score -= 0.18 * max(0.0, feat["centerline_penalty"] - 1.5)
+    score += 2.8 * feat["circular_occupancy"]
+    score += 1.6 * feat["isotropy"]
+    score -= 0.08 * max(0.0, feat["centerline_penalty"] - 1.5)
     return score
 
 
@@ -658,7 +658,7 @@ def main(mag="20x", debug=True):
     cells = filter_candidates_by_score(
         cells,
         gray_for_scoring=pp,
-        score_thresh=1.15, #tune this
+        score_thresh=0.5, #knob
         debug=debug
     )
 
@@ -780,7 +780,7 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in_focus={counts['in_focus_cells']}  out_focus={counts['out_of_focus_cells']}  "
+        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']} out/in = {round(counts['in_focus_cells']/counts['out_of_focus_cells'],2)} "
         f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
