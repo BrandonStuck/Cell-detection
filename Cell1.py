@@ -17,9 +17,9 @@ To do:
 
 MAG_CONFIGS = {
     "20x": {
-          "radius_px": (10, 34),
+    "radius_px": (11, 34),
     "sigma_step": 0.6,
-    "peak_percentile": 96.0,
+    "peak_percentile": 96.3,
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
@@ -30,6 +30,144 @@ MAG_CONFIGS = {
     },
 
 }
+def extract_patch(img, x, y, r):
+    """
+    Extract square patch centered at (x,y), radius r.
+    Returns patch and top-left corner (x0,y0). Returns None if too close to border.
+    """
+    h, w = img.shape[:2]
+    x0, x1 = x - r, x + r + 1
+    y0, y1 = y - r, y + r + 1
+    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
+        return None, None, None
+    return img[y0:y1, x0:x1], x0, y0
+
+
+def circular_mask(h, w, cx, cy, r_in, r_out=None):
+    """
+    Disk mask if r_out is None, ring mask otherwise.
+    """
+    yy, xx = np.ogrid[:h, :w]
+    d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+    if r_out is None:
+        return d2 <= (r_in ** 2)
+    return (d2 >= (r_in ** 2)) & (d2 <= (r_out ** 2))
+
+
+def sample_circle_points(cx, cy, r, n=32):
+    pts = []
+    for t in np.linspace(0, 2*np.pi, n, endpoint=False):
+        x = int(round(cx + r * np.cos(t)))
+        y = int(round(cy + r * np.sin(t)))
+        pts.append((x, y))
+    return pts
+
+
+def compute_candidate_features(gray, x, y, sigma):
+    """
+    Compute local patch features around one candidate.
+    Uses grayscale image after preprocessing/inversion (pp), not color image.
+    """
+    r = max(6, int(round(2.8 * sigma)))
+    patch, x0, y0 = extract_patch(gray, x, y, r)
+    if patch is None:
+        return None
+
+    ph, pw = patch.shape[:2]
+    cx = x - x0
+    cy = y - y0
+
+    # gradient
+    gx = cv2.Sobel(patch.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    gmag = np.sqrt(gx * gx + gy * gy)
+
+    # ---- feature 1: ring contrast ----
+    center_mask = circular_mask(ph, pw, cx, cy, max(2, int(0.45 * r)))
+    ring_mask = circular_mask(ph, pw, cx, cy, int(0.75 * r), int(1.15 * r))
+
+    center_mean = float(np.mean(patch[center_mask])) if np.any(center_mask) else 0.0
+    ring_mean = float(np.mean(patch[ring_mask])) if np.any(ring_mask) else 0.0
+
+    # for your inverted pp, true cells tend to have stronger ring than center
+    ring_contrast = ring_mean - center_mean
+
+    # ---- feature 2: circular edge occupancy ----
+    circle_pts = sample_circle_points(cx, cy, int(round(r)), n=40)
+    vals = []
+    for px, py in circle_pts:
+        if 0 <= px < pw and 0 <= py < ph:
+            vals.append(float(gmag[py, px]))
+    if len(vals) == 0:
+        return None
+
+    vals = np.array(vals, dtype=np.float32)
+    gthr = np.percentile(gmag, 75) if np.any(gmag > 0) else 0.0
+    circular_occupancy = float(np.mean(vals > gthr))
+
+    # ---- feature 3: isotropy ----
+    gx_abs = float(np.mean(np.abs(gx[ring_mask]))) if np.any(ring_mask) else 0.0
+    gy_abs = float(np.mean(np.abs(gy[ring_mask]))) if np.any(ring_mask) else 0.0
+    isotropy = min(gx_abs, gy_abs) / (max(gx_abs, gy_abs) + 1e-6)
+
+    # ---- feature 4: centerline penalty ----
+    # if gradient is overwhelmingly vertical/horizontal at center, it's often stripe junk
+    local_gx = float(np.mean(np.abs(gx[max(0, cy-1):min(ph, cy+2), max(0, cx-1):min(pw, cx+2)])))
+    local_gy = float(np.mean(np.abs(gy[max(0, cy-1):min(ph, cy+2), max(0, cx-1):min(pw, cx+2)])))
+    centerline_penalty = max(local_gx, local_gy) / (min(local_gx, local_gy) + 1e-6)
+
+    return {
+        "ring_contrast": ring_contrast,
+        "circular_occupancy": circular_occupancy,
+        "isotropy": isotropy,
+        "centerline_penalty": centerline_penalty,
+        "r": r
+    }
+
+
+def score_candidate(feat):
+    """
+    Combine features into one score.
+    Higher = more cell-like.
+    """
+    if feat is None:
+        return -1e9
+
+    score = 0.0
+    score += 0.08 * feat["ring_contrast"]
+    score += 2.2 * feat["circular_occupancy"]
+    score += 1.2 * feat["isotropy"]
+    score -= 0.18 * max(0.0, feat["centerline_penalty"] - 1.5)
+    return score
+
+
+def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.15, debug=False):
+    """
+    Keep only candidates that look cell-like in a local patch.
+    """
+    kept = []
+    scores = []
+
+    for c in cells:
+        feat = compute_candidate_features(gray_for_scoring, c["x"], c["y"], c["sigma"])
+        s = score_candidate(feat)
+        c["score"] = float(s)
+        if feat is not None:
+            c["ring_contrast"] = feat["ring_contrast"]
+            c["circular_occupancy"] = feat["circular_occupancy"]
+            c["isotropy"] = feat["isotropy"]
+            c["centerline_penalty"] = feat["centerline_penalty"]
+
+        scores.append(s)
+        if s >= score_thresh:
+            kept.append(c)
+
+    if debug and len(scores) > 0:
+        arr = np.array(scores, dtype=float)
+        print(f"Candidate score stats: min={arr.min():.2f} med={np.median(arr):.2f} max={arr.max():.2f}")
+        print(f"After candidate scoring: {len(kept)} / {len(cells)} kept")
+
+    return kept
 def sigmas_from_radius(radius_range, step=0.8):
     rmin, rmax = radius_range
     smin = rmin / 2.8
@@ -516,6 +654,13 @@ def main(mag="20x", debug=True):
     )
 
     print("After stripe gating:", len(cells))
+    # --- candidate scoring using local patch features ---
+    cells = filter_candidates_by_score(
+        cells,
+        gray_for_scoring=pp,
+        score_thresh=1.15, #tune this
+        debug=debug
+    )
 
     # --- NMS using cfg ---
     cells = filter_min_distance(cells, k=cfg["nms_k"])
