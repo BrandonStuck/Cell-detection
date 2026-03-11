@@ -23,7 +23,7 @@ MAG_CONFIGS = {
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 1.4,
+    "nms_k": 1.75,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
@@ -173,6 +173,56 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.5, debug=
         print("Score percentiles:",
               np.percentile(arr, [1, 5, 10, 25, 50, 75, 90, 95, 99]))
     return kept
+
+def detect_cells_from_edges(pp, stripe_safe, existing_cells=None,
+                            min_area=20, max_area=120, min_dist_to_existing=12):
+    gx = cv2.Sobel(pp.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(pp.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    gmag = np.sqrt(gx * gx + gy * gy)
+
+    vals = gmag[stripe_safe > 0]
+    if vals.size == 0:
+        return []
+
+    thr = np.percentile(vals, 92)   # much stricter than before
+    bw = (gmag > thr).astype(np.uint8) * 255
+    bw = cv2.bitwise_and(bw, stripe_safe)
+
+    # remove tiny specks
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, ker, iterations=1)
+
+    num, labels, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
+
+    out = []
+    for i in range(1, num):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_area:
+            continue
+
+        x, y = cent[i]
+        x = int(round(x))
+        y = int(round(y))
+
+        if existing_cells is not None:
+            too_close = False
+            for c in existing_cells:
+                dx = x - c["x"]
+                dy = y - c["y"]
+                if dx*dx + dy*dy < min_dist_to_existing**2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+        out.append({
+            "x": x,
+            "y": y,
+            "sigma": 4.8,   # use realistic small-cell sigma for 20x
+            "response": float(area)
+        })
+
+    return out
 def sigmas_from_radius(radius_range, step=0.8):
     rmin, rmax = radius_range
     smin = rmin / 2.8
@@ -658,7 +708,11 @@ def main(mag="20x", debug=True):
         max_px=cfg["stripe_gate_min_dist"]
     )
 
+
     print("After stripe gating:", len(cells))
+
+    edge_cells = detect_cells_from_edges(pp, stripe_safe, existing_cells=cells)
+    cells = cells + edge_cells
     # --- candidate scoring using local patch features ---
     cells = filter_candidates_by_score(
         cells,
@@ -785,7 +839,7 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']} out/in = {round(counts['in_focus_cells']/counts['out_of_focus_cells'],2)} "
+        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']} out/in = {round(counts['out_of_focus_cells']/counts['in_focus_cells'],2)} "
         f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
