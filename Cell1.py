@@ -23,7 +23,7 @@ MAG_CONFIGS = {
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 1.8,
+    "nms_k": 1.4,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
@@ -135,13 +135,13 @@ def score_candidate(feat):
 
     score = 0.0
     score += 0.08 * feat["ring_contrast"]
-    score += 2.8 * feat["circular_occupancy"]
-    score += 1.6 * feat["isotropy"]
-    score -= 0.08 * max(0.0, feat["centerline_penalty"] - 1.5)
+    score += 2.2 * feat["circular_occupancy"]
+    score += 1.2 * feat["isotropy"]
+    score -= 0.18 * max(0.0, feat["centerline_penalty"] - 1.5)
     return score
 
 
-def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.15, debug=False):
+def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.5, debug=False):
     """
     Keep only candidates that look cell-like in a local patch.
     """
@@ -167,6 +167,11 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.15, debug
         print(f"Candidate score stats: min={arr.min():.2f} med={np.median(arr):.2f} max={arr.max():.2f}")
         print(f"After candidate scoring: {len(kept)} / {len(cells)} kept")
 
+    valid_scores = [s for s in scores if s > -1e8]
+    if debug and len(valid_scores) > 0:
+        arr = np.array(valid_scores, dtype=float)
+        print("Score percentiles:",
+              np.percentile(arr, [1, 5, 10, 25, 50, 75, 90, 95, 99]))
     return kept
 def sigmas_from_radius(radius_range, step=0.8):
     rmin, rmax = radius_range
