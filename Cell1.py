@@ -7,6 +7,7 @@ from tkinter import Tk, filedialog
 from scipy.ndimage import gaussian_laplace
 from scipy.ndimage import maximum_filter
 from sklearn.cluster import DBSCAN
+import time
 
 """
 To do:
@@ -173,6 +174,7 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.5, debug=
         print("Score percentiles:",
               np.percentile(arr, [1, 5, 10, 25, 50, 75, 90, 95, 99]))
     return kept
+
 
 def detect_cells_from_edges(pp, stripe_safe, existing_cells=None,
                             min_area=20, max_area=120, min_dist_to_existing=12):
@@ -668,6 +670,7 @@ def main(mag="20x", debug=True):
         print("No file selected. Exiting.")
         return
 
+    t0 = time.perf_counter()
     img_color = cv2.imread(image_path)
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
@@ -717,7 +720,7 @@ def main(mag="20x", debug=True):
     cells = filter_candidates_by_score(
         cells,
         gray_for_scoring=pp,
-        score_thresh=0.5, #knob
+        score_thresh=4.0, #knob
         debug=debug
     )
 
@@ -749,6 +752,15 @@ def main(mag="20x", debug=True):
     else:
         for c in in_focus_cells:
             c["row"] = -1
+
+    print("stripe centerlines found:", len(centers))
+    print("centerlines:", centers[:20])
+
+    row_ids = [c["row"] for c in in_focus_cells]
+    print("unique row ids:", sorted(set(row_ids))[:20], "count =", len(set(row_ids)))
+
+    sigs = [c["sigma"] for c in cells]
+    print("unique sigmas sample:", sorted(set(round(s, 2) for s in sigs))[:10])
 
     # --- clustering using cfg ---
     med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
@@ -853,6 +865,9 @@ def main(mag="20x", debug=True):
     cv2.imwrite(out_path, canvas)
     print(f"Saved: {out_path}")
 
+    elapsed = time.perf_counter() - t0
+    print(f"Total processing time: {elapsed:.3f} s")
+    
     # --- Show in a window and BLOCK until user closes it ---
     win = "Cell Detection Report"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
