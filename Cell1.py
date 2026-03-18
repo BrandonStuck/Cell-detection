@@ -142,10 +142,7 @@ def score_candidate(feat):
     return score
 
 
-def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.5, debug=False):
-    """
-    Keep only candidates that look cell-like in a local patch.
-    """
+def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=4.0, debug=False):
     kept = []
     scores = []
 
@@ -174,7 +171,6 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=1.5, debug=
         print("Score percentiles:",
               np.percentile(arr, [1, 5, 10, 25, 50, 75, 90, 95, 99]))
     return kept
-
 
 def detect_cells_from_edges(pp, stripe_safe, existing_cells=None,
                             min_area=20, max_area=120, min_dist_to_existing=12):
@@ -720,7 +716,7 @@ def main(mag="20x", debug=True):
     cells = filter_candidates_by_score(
         cells,
         gray_for_scoring=pp,
-        score_thresh=4.0, #knob
+        score_thresh=7.0, #knob
         debug=debug
     )
 
