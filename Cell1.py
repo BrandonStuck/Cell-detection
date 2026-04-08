@@ -24,20 +24,6 @@ MAG_CONFIGS = {
     "cluster_min_samples": 2,
     },
     "20x_1mil": {
-        "radius_px": (11, 34),
-        "sigma_step": 0.6,
-        "peak_k_mad": 3.5,
-        "edge_k_mad": 3.2,
-        "score_thresh": 6.0,
-        "stripe_gate_k": 1.0,
-        "stripe_gate_min_dist": 22,
-        "border_margin": 60,
-        "nms_k": 1.65,
-        "focus_sigma_abs": 6.0,
-        "cluster_eps_mult": 3.5,
-        "cluster_min_samples": 2,
-    },
-    "20x_0.5mil": {
         "radius_px": (10, 28),
         "sigma_step": 0.5,
         "peak_percentile": 96.5,
@@ -49,9 +35,23 @@ MAG_CONFIGS = {
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
         "score_thresh": 9.5,
-"min_circular_occupancy": 0.42,
-"min_isotropy": 0.55,
-"max_centerline_penalty": 3.2,
+"use_stripe_center_gating": True,
+"use_row_based_clustering": True,
+    },
+    "20x_0.5mil": {
+        "radius_px": (8, 22),
+        "sigma_step": 0.4,
+        "peak_percentile": 95.4,
+        "stripe_gate_k": 1.10,
+        "stripe_gate_min_dist": 24,
+        "border_margin": 60,
+        "nms_k": 1.60,
+        "focus_sigma_percentile": 70,
+        "cluster_eps_mult": 3.5,
+        "cluster_min_samples": 2,
+        "score_thresh": 7.0,
+"use_stripe_center_gating": False,
+"use_row_based_clustering": False,
     },
 }
 def extract_patch(img, x, y, r):
@@ -178,10 +178,10 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=4.0, debug=
             c["circular_occupancy"] = feat["circular_occupancy"]
             c["isotropy"] = feat["isotropy"]
             c["centerline_penalty"] = feat["centerline_penalty"]
-        if feat is None:
-            continue
 
-
+        scores.append(s)
+        if s >= score_thresh:
+            kept.append(c)
 
     if debug and len(scores) > 0:
         arr = np.array(scores, dtype=float)
@@ -724,7 +724,9 @@ def main(mag="20x", debug=True):
     print("stripe_safe coverage:", np.mean(stripe_safe > 0))
     print(f"After valid-mask gate: {len(cells)}")
 
-    cells = gate_by_stripe_centers_scale(
+
+    if cfg.get("use_stripe_center_gating", True):
+        cells = gate_by_stripe_centers_scale(
         cells, stripe_bin,
         k=cfg["stripe_gate_k"],
         max_px=cfg["stripe_gate_min_dist"]
@@ -782,54 +784,54 @@ def main(mag="20x", debug=True):
     print("unique sigmas sample:", sorted(set(round(s, 2) for s in sigs))[:10])
 
     # --- clustering using cfg ---
-    med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
-    med_radius = 2.8 * med_sigma
-    cluster_eps = cfg["cluster_eps_mult"] * med_radius
-    #cluster_eps = min(cluster_eps, 1.6 * cfg["radius_px"][1])
-    min_cluster_size = cfg["cluster_min_samples"]
+    clusters = []
+    if cfg.get("use_row_based_clustering", True):
+        med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
+        med_radius = 2.8 * med_sigma
+        cluster_eps = cfg["cluster_eps_mult"] * med_radius
+        min_cluster_size = cfg["cluster_min_samples"]
 
-    next_cluster_id = 0
-    for c in in_focus_cells:
-        c["cluster"] = -1
+        next_cluster_id = 0
+        for c in in_focus_cells:
+            c["cluster"] = -1
 
-    for row_id in sorted(set(c["row"] for c in in_focus_cells)):
-        row_cells = [c for c in in_focus_cells if c["row"] == row_id]
-        if len(row_cells) < cfg["cluster_min_samples"]:
-            continue
+        for row_id in sorted(set(c["row"] for c in in_focus_cells)):
+            row_cells = [c for c in in_focus_cells if c["row"] == row_id]
+            if len(row_cells) < cfg["cluster_min_samples"]:
+                continue
 
-        # IMPORTANT: within-row eps can be bigger now
-        eps_row = cluster_eps * 1.6  # NEW knob: 1.0–1.8 typically
+            # IMPORTANT: within-row eps can be bigger now
+            eps_row = cluster_eps * 1.6  # NEW knob: 1.0–1.8 typically
 
-        labels, _ = find_clusters_dbscan(row_cells, eps=eps_row, min_samples=cfg["cluster_min_samples"])
+            labels, _ = find_clusters_dbscan(row_cells, eps=eps_row, min_samples=cfg["cluster_min_samples"])
 
-        # remap row-local labels to global unique cluster IDs
-        for c, lbl in zip(row_cells, labels):
-            if int(lbl) == -1:
-                c["cluster"] = -1
-            else:
-                c["cluster"] = next_cluster_id + int(lbl)
+            # remap row-local labels to global unique cluster IDs
+            for c, lbl in zip(row_cells, labels):
+                if int(lbl) == -1:
+                    c["cluster"] = -1
+                else:
+                    c["cluster"] = next_cluster_id + int(lbl)
 
-        # advance cluster id counter
-        n_row_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        next_cluster_id += n_row_clusters
+            # advance cluster id counter
+            n_row_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            next_cluster_id += n_row_clusters
+        total_clusters = len(set(c["cluster"] for c in in_focus_cells) - {-1})
+        print(f"Clusters detected: {total_clusters}")
 
-    total_clusters = len(set(c["cluster"] for c in in_focus_cells) - {-1})
-    print(f"Clusters detected: {total_clusters}")
+        # --------------------------------------------------
+        # Counting
+        # --------------------------------------------------
+        cluster_groups = {}
+        for c in in_focus_cells:
+            cluster_groups.setdefault(c["cluster"], []).append(c)
 
-    # --------------------------------------------------
-    # Counting
-    # --------------------------------------------------
-    cluster_groups = {}
-    for c in in_focus_cells:
-        cluster_groups.setdefault(c["cluster"], []).append(c)
+        clusters = [v for k, v in cluster_groups.items() if k != -1]
 
-    clusters = [v for k, v in cluster_groups.items() if k != -1]
+        counts = count_results(cells, clusters)
 
-    counts = count_results(cells, clusters)
-
-    print("----- Results -----")
-    for k, v in counts.items():
-        print(f"{k}: {v}")
+        print("----- Results -----")
+        for k, v in counts.items():
+            print(f"{k}: {v}")
 
     # --------------------------------------------------
     # Visualization
