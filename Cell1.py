@@ -9,16 +9,10 @@ from scipy.ndimage import maximum_filter
 from sklearn.cluster import DBSCAN
 import time
 
-"""
-To do:
-    1) Refine 20x images
-    2) Add option for 10x and 4x (doesnt have to be too reliable, just adjust parameters)
-    3) Turn on voltage
-    4) Prepare script to run on laptop (interface, folders)"""
 
 MAG_CONFIGS = {
-    "20x": {
-    "radius_px": (11, 34),
+    "20x_2mil": {
+          "radius_px": (11, 34),
     "sigma_step": 0.6,
     "peak_percentile": 96.3,
     "stripe_gate_k": 1.0,
@@ -29,7 +23,36 @@ MAG_CONFIGS = {
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
     },
-
+    "20x_1mil": {
+        "radius_px": (11, 34),
+        "sigma_step": 0.6,
+        "peak_k_mad": 3.5,
+        "edge_k_mad": 3.2,
+        "score_thresh": 6.0,
+        "stripe_gate_k": 1.0,
+        "stripe_gate_min_dist": 22,
+        "border_margin": 60,
+        "nms_k": 1.65,
+        "focus_sigma_abs": 6.0,
+        "cluster_eps_mult": 3.5,
+        "cluster_min_samples": 2,
+    },
+    "20x_0.5mil": {
+        "radius_px": (10, 28),
+        "sigma_step": 0.5,
+        "peak_percentile": 96.5,
+        "stripe_gate_k": 1.15,
+        "stripe_gate_min_dist": 26,
+        "border_margin": 60,
+        "nms_k": 1.85,
+        "focus_sigma_percentile": 70,
+        "cluster_eps_mult": 3.5,
+        "cluster_min_samples": 2,
+        "score_thresh": 9.5,
+"min_circular_occupancy": 0.42,
+"min_isotropy": 0.55,
+"max_centerline_penalty": 3.2,
+    },
 }
 def extract_patch(img, x, y, r):
     """
@@ -155,10 +178,10 @@ def filter_candidates_by_score(cells, gray_for_scoring, score_thresh=4.0, debug=
             c["circular_occupancy"] = feat["circular_occupancy"]
             c["isotropy"] = feat["isotropy"]
             c["centerline_penalty"] = feat["centerline_penalty"]
+        if feat is None:
+            continue
 
-        scores.append(s)
-        if s >= score_thresh:
-            kept.append(c)
+
 
     if debug and len(scores) > 0:
         arr = np.array(scores, dtype=float)
@@ -716,7 +739,7 @@ def main(mag="20x", debug=True):
     cells = filter_candidates_by_score(
         cells,
         gray_for_scoring=pp,
-        score_thresh=7.0, #knob
+        score_thresh=cfg.get("score_thresh", 7.0),
         debug=debug
     )
 
@@ -847,7 +870,7 @@ def main(mag="20x", debug=True):
     # Footer text
     counts = count_results(cells, clusters)  # you already computed this above; reuse if you want
     footer = (
-        f"Data: in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']} out/in = {round(counts['out_of_focus_cells']/counts['in_focus_cells'],2)} "
+        f"Data: total = {counts['in_focus_cells'] + counts['out_of_focus_cells']}   in focus={counts['in_focus_cells']}  out focus={counts['out_of_focus_cells']} out/in = {round(counts['out_of_focus_cells']/counts['in_focus_cells'],2)} "
         f"clusters={counts['clusters']}  cells_in_clusters={counts['cells_in_clusters']}"
     )
     footer_scale = 0.9
@@ -885,5 +908,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x", debug=True)
+main(mag="20x_0.5mil", debug=True)
 
