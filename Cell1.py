@@ -41,15 +41,16 @@ MAG_CONFIGS = {
     "20x_0.5mil": {
         "radius_px": (8, 22),
         "sigma_step": 0.4,
-        "peak_percentile": 95.4,
+        "peak_percentile": 96.0,
         "stripe_gate_k": 1.10,
         "stripe_gate_min_dist": 24,
         "border_margin": 60,
-        "nms_k": 1.60,
+        "nms_k": 1.90,
         "focus_sigma_percentile": 70,
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
-        "score_thresh": 7.0,
+        "score_thresh": 9.2,
+        "top_exclude_px": 70,
 "use_stripe_center_gating": False,
 "use_row_based_clustering": False,
     },
@@ -626,7 +627,7 @@ def draw_cells_and_clusters(
         x, y = int(c["x"]), int(c["y"])
         r = int(2.8 * c["sigma"])
 
-        if c["cluster"] == -1:
+        if c.get("cluster", -1) == -1:
             color = (0, 255, 0)      # green = single cell
         else:
             color = (0, 0, 255)      # red = clustered
@@ -646,7 +647,7 @@ def draw_cells_and_clusters(
     if draw_hulls:
         clusters = {}
         for c in in_focus_cells:
-            lbl = c["cluster"]
+            lbl = c.get("cluster", -1)
             if lbl == -1:
                 continue
             clusters.setdefault(lbl, []).append((c["x"], c["y"]))
@@ -717,6 +718,10 @@ def main(mag="20x", debug=True):
     print(f"Raw detections (pre-valid): {len(cells)}")
 
     cells = [c for c in cells if valid[c["y"], c["x"]] > 0]
+    top_exclude_px = cfg.get("top_exclude_px", 0)
+    if top_exclude_px > 0:
+        cells = [c for c in cells if c["y"] >= top_exclude_px]
+
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
     cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
 
@@ -765,6 +770,8 @@ def main(mag="20x", debug=True):
     in_focus_cells = [c for c in cells if c["focus"] == "in"]
     out_of_focus_cells = [c for c in cells if c["focus"] == "out"]
 
+    clusters = []
+
     centers = stripe_centerlines(stripe_bin)  # use binary, not blurred
     if len(centers) > 0:
         # assign each cell to nearest stripe centerline
@@ -784,7 +791,7 @@ def main(mag="20x", debug=True):
     print("unique sigmas sample:", sorted(set(round(s, 2) for s in sigs))[:10])
 
     # --- clustering using cfg ---
-    clusters = []
+
     if cfg.get("use_row_based_clustering", True):
         med_sigma = np.median([c["sigma"] for c in in_focus_cells]) if in_focus_cells else 4.0
         med_radius = 2.8 * med_sigma
