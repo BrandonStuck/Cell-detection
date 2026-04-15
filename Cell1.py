@@ -39,7 +39,7 @@ MAG_CONFIGS = {
 "use_row_based_clustering": True,
     },
     "20x_0.5mil": {
-        "radius_px": (8, 22),
+        "radius_px": (10, 22),
         "sigma_step": 0.4,
         "peak_percentile": 96.0,
         "stripe_gate_k": 1.10,
@@ -51,6 +51,7 @@ MAG_CONFIGS = {
         "cluster_min_samples": 2,
         "score_thresh": 9.2,
         "top_exclude_px": 70,
+"min_sigma_keep": 4.2,
 "use_stripe_center_gating": False,
 "use_row_based_clustering": False,
     },
@@ -750,6 +751,9 @@ def main(mag="20x", debug=True):
         debug=debug
     )
 
+    min_sigma_keep = cfg.get("min_sigma_keep", 0.0)
+    if min_sigma_keep > 0:
+        cells = [c for c in cells if c["sigma"] >= min_sigma_keep]
     # --- NMS using cfg ---
     cells = filter_min_distance(cells, k=cfg["nms_k"])
     if debug:
