@@ -29,15 +29,15 @@ MAG_CONFIGS = {
     "20x_1mil": {
         "radius_px": (10, 28),
         "sigma_step": 0.5,
-        "peak_percentile": 96.5,
+        "peak_percentile": 96.8,
         "stripe_gate_k": 1.15,
         "stripe_gate_min_dist": 26,
         "border_margin": 60,
-        "nms_k": 1.85,
+        "nms_k": 2.1,
         "focus_sigma_percentile": 70,
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
-        "score_thresh": 9.5,
+        "score_thresh": 10.6,
 "use_stripe_center_gating": True,
 "use_row_based_clustering": True,
     },
@@ -969,5 +969,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x_2mil", debug=True)
+main(mag="20x_1mil", debug=True)
 
