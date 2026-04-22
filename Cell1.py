@@ -14,14 +14,17 @@ MAG_CONFIGS = {
     "20x_2mil": {
           "radius_px": (11, 34),
     "sigma_step": 0.6,
-    "peak_percentile": 96.3,
+    "peak_percentile": 96.0,
     "stripe_gate_k": 1.0,
     "stripe_gate_min_dist": 22,
     "border_margin": 60,
-    "nms_k": 1.75,
+    "nms_k": 1.45,
     "focus_sigma_percentile": 70,
     "cluster_eps_mult": 3.5,
     "cluster_min_samples": 2,
+"score_thresh": 5.5,
+"use_stripe_center_gating": True,
+"use_row_based_clustering": True,
     },
     "20x_1mil": {
         "radius_px": (10, 28),
@@ -39,22 +42,26 @@ MAG_CONFIGS = {
 "use_row_based_clustering": True,
     },
     "20x_0.5mil": {
-        "radius_px": (10, 22),
+        "radius_px": (8, 22),
         "sigma_step": 0.4,
         "peak_percentile": 96.0,
-        "stripe_gate_k": 1.10,
+        "stripe_gate_k": 1.1,
         "stripe_gate_min_dist": 24,
         "border_margin": 60,
-        "nms_k": 1.90,
+        "nms_k": 1.9,
         "focus_sigma_percentile": 70,
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
         "score_thresh": 9.2,
         "top_exclude_px": 70,
-"min_sigma_keep": 4.2,
-"use_stripe_center_gating": False,
-"use_row_based_clustering": False,
-    },
+        "bottom_exclude_px": 90,
+        "use_stripe_center_gating": False,
+        "use_row_based_clustering": False,
+        "min_sigma_keep": 3.9,
+        "use_xy_nms": True,
+        "x_nms_mult": 2.4,
+        "y_nms_px": 16,
+    }
 }
 def extract_patch(img, x, y, r):
     """
@@ -527,6 +534,35 @@ def filter_min_distance(cells, k=1.1, r_scale=2.8):
             kept.append(c)
     return kept
 
+def filter_min_distance_xy(cells, x_mult=2.0, y_px=16, r_scale=2.8):
+    """
+    Anisotropic NMS:
+    - more aggressive along x (same stripe direction)
+    - limited tolerance in y so nearby rows do not suppress each other
+
+    x_thr = x_mult * effective cell radius
+    y_px  = fixed same-row tolerance in pixels
+    """
+    kept = []
+
+    for c in sorted(cells, key=lambda x: -x["response"]):
+        x, y, s = c["x"], c["y"], float(c["sigma"])
+        ok = True
+
+        for kpt in kept:
+            dx = abs(x - kpt["x"])
+            dy = abs(y - kpt["y"])
+
+            x_thr = x_mult * r_scale * math.sqrt(s * float(kpt["sigma"]))
+
+            if dx < x_thr and dy < y_px:
+                ok = False
+                break
+
+        if ok:
+            kept.append(c)
+
+    return kept
 # -------------Cluster Detection------------------------
 def detect_clusters(cells, cluster_dist):
     clusters = []
@@ -723,6 +759,11 @@ def main(mag="20x", debug=True):
     if top_exclude_px > 0:
         cells = [c for c in cells if c["y"] >= top_exclude_px]
 
+    bottom_exclude_px = cfg.get("bottom_exclude_px", 0)
+    if bottom_exclude_px > 0:
+        h_img = img_rot.shape[0]
+        cells = [c for c in cells if c["y"] < h_img - bottom_exclude_px]
+
     cells = gate_by_constant_border(cells, valid, buffer_px=cfg["border_margin"])
     cells = [c for c in cells if stripe_safe[c["y"], c["x"]] > 0]
 
@@ -755,7 +796,14 @@ def main(mag="20x", debug=True):
     if min_sigma_keep > 0:
         cells = [c for c in cells if c["sigma"] >= min_sigma_keep]
     # --- NMS using cfg ---
-    cells = filter_min_distance(cells, k=cfg["nms_k"])
+    if cfg.get("use_xy_nms", False):
+        cells = filter_min_distance_xy(
+            cells,
+            x_mult=cfg.get("x_nms_mult", 2.0),
+            y_px=cfg.get("y_nms_px", 16)
+        )
+    else:
+        cells = filter_min_distance(cells, k=cfg["nms_k"])
     if debug:
         print(f"After min-distance filtering: {len(cells)}")
 
@@ -921,5 +969,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x_0.5mil", debug=True)
+main(mag="20x_2mil", debug=True)
 
