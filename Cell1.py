@@ -25,6 +25,8 @@ MAG_CONFIGS = {
 "score_thresh": 5.5,
 "use_stripe_center_gating": True,
 "use_row_based_clustering": True,
+"focus_sigma_thresh_abs": 4.8,
+"occupancy_thresh" : 0.46,
     },
     "20x_1mil": {
         "radius_px": (10, 28),
@@ -52,15 +54,15 @@ MAG_CONFIGS = {
         "focus_sigma_percentile": 70,
         "cluster_eps_mult": 3.5,
         "cluster_min_samples": 2,
-        "score_thresh": 9.2,
+        "score_thresh": 10.0,
         "top_exclude_px": 70,
         "bottom_exclude_px": 90,
         "use_stripe_center_gating": False,
         "use_row_based_clustering": False,
-        "min_sigma_keep": 3.9,
+        "min_sigma_keep": 4.2,
         "use_xy_nms": True,
-        "x_nms_mult": 2.4,
-        "y_nms_px": 16,
+        "x_nms_mult": 3.7,
+        "y_nms_px": 12,
     }
 }
 def extract_patch(img, x, y, r):
@@ -631,6 +633,18 @@ def nms_within_clusters(cells, labels, k=2.2):
 
     return kept
 
+def classify_focus_2(cells, sigma_thresh=4.8, occupancy_thresh=0.42):
+    for c in cells:
+        sigma = c.get("sigma", 0.0)
+        occ = c.get("circular_occupancy", 1.0)
+
+        if sigma > sigma_thresh or occ < occupancy_thresh:
+            c["focus"] = "out"
+        else:
+            c["focus"] = "in"
+
+    return cells
+
 #-----------------Circle Drawing------------------
 def count_results(cells, clusters):
     in_focus = [c for c in cells if c["focus"] == "in"]
@@ -813,10 +827,41 @@ def main(mag="20x", debug=True):
         print("No cells left after filtering.")
         return
 
-    focus_sigma_thresh = np.percentile(sig, cfg.get("focus_sigma_percentile", 60))
     print(f"sigma stats: min={sig.min():.2f} med={np.median(sig):.2f} max={sig.max():.2f}")
 
-    cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
+    occ_present = sum(1 for c in cells if "circular_occupancy" in c)
+    print(f"cells with circular_occupancy: {occ_present} / {len(cells)}")
+
+    occ_vals = [c.get("circular_occupancy", -1) for c in cells]
+    print("occupancy unique sample:", sorted(set(round(v, 3) for v in occ_vals if v >= 0))[:20])
+    print("occupancy percentiles:", np.percentile([v for v in occ_vals if v >= 0], [1, 5, 10, 25, 50, 75, 90, 95, 99]))
+
+    if cfg.get("use_2feature_focus", False):
+        focus_sigma_thresh = cfg.get("focus_sigma_thresh_abs", 4.8)
+        focus_occupancy_thresh = cfg.get("focus_occupancy_thresh", 0.42)
+
+        print(f"Using 2-feature focus classification: sigma>{focus_sigma_thresh}, occupancy<{focus_occupancy_thresh}")
+
+        cells = classify_focus_2(
+            cells,
+            sigma_thresh=focus_sigma_thresh,
+            occupancy_thresh=focus_occupancy_thresh
+        )
+    else:
+        focus_sigma_thresh = np.percentile(sig, cfg.get("focus_sigma_percentile", 60))
+        print(f"Using percentile focus classification: sigma_thresh={focus_sigma_thresh:.2f}")
+
+        cells = classify_focus(cells, sigma_thresh=focus_sigma_thresh)
+    sigma_thresh = cfg.get("focus_sigma_thresh_abs", 4.8)
+    occ_thresh = cfg.get("focus_occupancy_thresh", 0.42)
+
+    n_sigma = sum(1 for c in cells if c.get("sigma", 0) > sigma_thresh)
+    n_occ = sum(1 for c in cells if c.get("circular_occupancy", 1.0) < occ_thresh)
+    n_both = sum(1 for c in cells if c.get("sigma", 0) > sigma_thresh and c.get("circular_occupancy", 1.0) < occ_thresh)
+
+    print("sigma > thresh:", n_sigma)
+    print("occupancy < thresh:", n_occ)
+    print("both conditions:", n_both)
 
     # split
     in_focus_cells = [c for c in cells if c["focus"] == "in"]
@@ -969,5 +1014,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x_1mil", debug=True)
+main(mag="20x_2mil", debug=True)
 
