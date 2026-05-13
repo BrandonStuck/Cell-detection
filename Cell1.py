@@ -43,6 +43,9 @@ MAG_CONFIGS = {
         "score_thresh": 10.6,
 "use_stripe_center_gating": True,
 "use_row_based_clustering": True,
+"use_2feature_focus": True,
+"focus_sigma_thresh_abs": 6.9,
+"focus_occupancy_thresh": 0.01,
     },
     "20x_0.5mil": {
         "radius_px": (8, 22),
@@ -999,5 +1002,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x_2mil", debug=True)
+main(mag="20x_1mil", debug=True)
 
