@@ -27,7 +27,7 @@ MAG_CONFIGS = {
 "use_row_based_clustering": True,
 "use_2feature_focus": True,
 "focus_sigma_thresh_abs": 4.8,
-"focus_occupancy_thresh": 0.18,
+"focus_occupancy_thresh": 0.08,
     },
     "20x_1mil": {
         "radius_px": (10, 28),
