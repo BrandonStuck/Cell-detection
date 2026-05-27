@@ -67,6 +67,9 @@ MAG_CONFIGS = {
         "use_xy_nms": True,
         "x_nms_mult": 3.7,
         "y_nms_px": 12,
+"use_2feature_focus": True,
+"focus_sigma_thresh_abs": 5.8,
+"focus_occupancy_thresh": 0.1,
     }
 }
 def extract_patch(img, x, y, r):
@@ -1002,5 +1005,5 @@ def main(mag="20x", debug=True):
 
 
 # run main
-main(mag="20x_1mil", debug=True)
+main(mag="20x_0.5mil", debug=True)
 
